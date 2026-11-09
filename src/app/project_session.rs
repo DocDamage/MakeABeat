@@ -1,14 +1,15 @@
-use crate::files::{self, Project};
+use super::recovery_workflow::Recovery;
+use crate::{
+    audio::Clip,
+    files::{self, Project},
+};
+use eframe::egui;
 use std::{
-    fs,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant},
 };
 
 const UNDO_LIMIT: usize = 64;
-const RECOVERY_INTERVAL: Duration = Duration::from_secs(20);
-const RECOVERY_SLOTS: [&str; 2] = ["snapshot-0.flip", "snapshot-1.flip"];
 
 pub(super) struct Session {
     pub path: Option<PathBuf>,
@@ -18,18 +19,15 @@ pub(super) struct Session {
     undo: Vec<Arc<Project>>,
     redo: Vec<Arc<Project>>,
     grouped: bool,
-    recovery_dir: Option<PathBuf>,
+    recovery: Option<Recovery>,
     pub available_recovery: Option<PathBuf>,
     pub show_recovery: bool,
-    recovery_slot: usize,
-    recovered_snapshot: Option<Arc<Project>>,
-    last_recovery: Instant,
 }
 
 impl Session {
-    pub fn new(project: Project, nonce: u64) -> Self {
+    pub fn new(project: Project, nonce: u64, ctx: egui::Context) -> Self {
         let root = files::app_data_dir().map(|path| path.join("recovery"));
-        let available_recovery = root.as_deref().and_then(find_recovery);
+        let available_recovery = root.as_deref().and_then(files::recovery::find);
         let current = Arc::new(project);
         Self {
             path: None,
@@ -39,17 +37,20 @@ impl Session {
             undo: Vec::new(),
             redo: Vec::new(),
             grouped: false,
-            recovery_dir: root.map(|path| path.join(format!("{:x}-{nonce:x}", std::process::id()))),
+            recovery: root.map(|path| {
+                Recovery::new(
+                    path.join(format!("{:x}-{nonce:x}", std::process::id())),
+                    ctx,
+                )
+            }),
             show_recovery: available_recovery.is_some(),
             available_recovery,
-            recovery_slot: 0,
-            recovered_snapshot: None,
-            last_recovery: Instant::now(),
         }
     }
 
     pub fn dirty(&self) -> bool {
-        self.restored.is_some() || self.current != self.saved
+        self.restored.is_some()
+            || (!Arc::ptr_eq(&self.current, &self.saved) && self.current != self.saved)
     }
 
     pub fn reset(&mut self, project: Project, path: Option<PathBuf>, restored: Option<PathBuf>) {
@@ -61,7 +62,6 @@ impl Session {
         self.undo.clear();
         self.redo.clear();
         self.grouped = false;
-        self.last_recovery = Instant::now();
     }
 
     pub fn observe(&mut self, project: Project, group: bool) {
@@ -107,67 +107,46 @@ impl Session {
     pub fn mark_saved(&mut self, path: PathBuf, project: Arc<Project>) {
         self.path = Some(path);
         self.saved = project;
-        if let Some(dir) = self.restored.take().as_deref().and_then(Path::parent) {
-            remove_snapshots(dir);
-        }
+        self.remove_restored_recovery();
         if !self.dirty() {
             self.clear_recovery();
         }
     }
 
-    pub fn recovery_target(&mut self) -> Option<PathBuf> {
-        if !self.dirty()
-            || self.last_recovery.elapsed() < RECOVERY_INTERVAL
-            || self.recovered_snapshot.as_ref() == Some(&self.current)
-        {
-            return None;
+    pub fn autosave(&mut self, clip: Option<&Arc<Clip>>, enabled: bool) -> Option<String> {
+        let dirty = self.dirty();
+        let recovery = self.recovery.as_mut()?;
+        let error = recovery.poll();
+        if !dirty {
+            recovery.clear_if_needed();
+        } else if enabled && let Err(message) = recovery.save(&self.current, clip) {
+            return Some(message);
         }
-        let path = self
-            .recovery_dir
-            .as_ref()?
-            .join(RECOVERY_SLOTS[self.recovery_slot]);
-        self.last_recovery = Instant::now();
-        Some(path)
+        error
     }
 
-    pub fn recovery_written(&mut self, project: Arc<Project>) {
-        self.recovery_slot = (self.recovery_slot + 1) % RECOVERY_SLOTS.len();
-        self.recovered_snapshot = Some(project);
-        if !self.dirty() {
-            self.clear_recovery();
-        }
+    pub fn cleaning_recovery(&self) -> bool {
+        self.recovery.as_ref().is_some_and(Recovery::cleaning)
     }
 
     pub fn clear_recovery(&mut self) {
-        if let Some(path) = self.recovery_dir.as_deref() {
-            remove_snapshots(path);
+        if let Some(recovery) = &mut self.recovery {
+            recovery.clear();
         }
-        self.recovered_snapshot = None;
     }
 
     pub fn discard(&mut self) {
-        if let Some(path) = self.restored.take().as_deref().and_then(Path::parent) {
-            remove_snapshots(path);
-        }
+        self.remove_restored_recovery();
         self.clear_recovery();
     }
-}
 
-fn find_recovery(root: &Path) -> Option<PathBuf> {
-    fs::read_dir(root)
-        .ok()?
-        .flatten()
-        .flat_map(|entry| RECOVERY_SLOTS.map(|name| entry.path().join(name)))
-        .filter_map(|path| Some((path.metadata().ok()?.modified().ok()?, path)))
-        .max_by_key(|(modified, _)| *modified)
-        .map(|(_, path)| path)
-}
-
-fn remove_snapshots(dir: &Path) {
-    for name in RECOVERY_SLOTS {
-        let _ = fs::remove_file(dir.join(name));
+    fn remove_restored_recovery(&mut self) {
+        if let Some(dir) = self.restored.take().as_deref().and_then(Path::parent)
+            && let Some(recovery) = &mut self.recovery
+        {
+            recovery.remove(dir.to_owned());
+        }
     }
-    let _ = fs::remove_dir(dir);
 }
 
 #[cfg(test)]
@@ -189,8 +168,7 @@ mod tests {
 
     #[test]
     fn finishing_an_older_save_preserves_newer_edits_and_undo_reaches_saved_state() {
-        let mut session = Session::new(snapshot(90), 1);
-        session.recovery_dir = None;
+        let mut session = Session::new(snapshot(90), 1, egui::Context::default());
         session.observe(snapshot(100), true);
         let saving = session.current.clone();
         session.observe(snapshot(110), true);

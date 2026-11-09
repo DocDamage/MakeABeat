@@ -4,26 +4,13 @@ use crate::{
     background,
     files::{self, Result},
     model::melody::{BEND_RANGE, MAX_POINTS},
+    subprocess::{self, Capture},
 };
 use serde::Deserialize;
 use serde_json::json;
-use std::{
-    fs,
-    path::Path,
-    process::{Child, Command, Stdio},
-    time::{Duration, Instant},
-};
+use std::{fs, path::Path, process::Command, time::Duration};
 
 const SCRIPT: &str = include_str!("../../workers/audio_analysis/basic_pitch_worker.py");
-
-struct Process(Child);
-
-impl Drop for Process {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
 
 #[derive(Deserialize)]
 struct Reply {
@@ -53,37 +40,15 @@ pub fn analyze(
     )?;
     background::stage("Detecting notes with Basic Pitch")?;
     let mut command = Command::new(python);
-    command
-        .args(["-u", "-c", SCRIPT])
-        .arg(request)
-        .arg(&output)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000);
-    }
-    let mut child =
-        Process(command.spawn().map_err(|error| {
-            format!("Could not start the Basic Pitch Python environment. {error}")
-        })?);
-    #[cfg(windows)]
-    let _tree = crate::analysis_worker::bind_worker_tree(&child.0)?;
-    let started = Instant::now();
-    loop {
-        background::check()?;
-        if let Some(status) = child.0.try_wait()? {
-            if !status.success() {
-                return Err("Basic Pitch stopped before returning notes.".into());
-            }
-            break;
-        }
-        if started.elapsed() > Duration::from_secs(240) {
-            return Err("Basic Pitch timed out.".into());
-        }
-        std::thread::sleep(Duration::from_millis(25));
+    command.args(["-u", "-c", SCRIPT]).arg(request).arg(&output);
+    let result = subprocess::run(
+        &mut command,
+        "Basic Pitch",
+        Duration::from_secs(240),
+        Capture::default(),
+    )?;
+    if !result.status.success() {
+        return Err("Basic Pitch stopped before returning notes.".into());
     }
     if fs::metadata(&output)?.len() > 8 * 1024 * 1024 {
         return Err("The transcription result is too large. Choose a shorter selection.".into());
@@ -116,7 +81,7 @@ pub fn analyze(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::BTreeMap, path::PathBuf};
+    use std::{collections::BTreeMap, path::PathBuf, time::Instant};
 
     #[derive(Deserialize)]
     struct Label {

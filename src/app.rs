@@ -1,6 +1,10 @@
 mod audition_workflow;
 mod beat_workflow;
+mod extraction_workflow;
 mod groove_workflow;
+mod library_persistence;
+mod recovery_workflow;
+pub(crate) mod sequence_workflow;
 pub(crate) mod search_workflow;
 mod taste_workflow;
 pub(crate) mod transcription_workflow;
@@ -82,7 +86,6 @@ pub enum Job {
     },
     Opened(Box<Project>, Option<Clip>, PathBuf, OpenKind),
     Saved(PathBuf, Arc<Project>),
-    RecoveryWritten(Arc<Project>),
     Folder(Vec<Record>),
     Tempo(usize, crate::tempo::Estimate),
     SourceAdded(Record, Clip, Option<usize>),
@@ -156,6 +159,7 @@ pub struct App {
     session: project_session::Session,
     pending_change: Option<PendingChange>,
     discard_after_analysis: bool,
+    finishing_close: bool,
     closing: bool,
     ctx: egui::Context,
     pub page: Page,
@@ -262,6 +266,7 @@ pub struct App {
     pub quantize: Quantize,
     pub piano_roll: Option<crate::ui::piano_roll::PianoRoll>,
     pub(crate) transcription: transcription_workflow::State,
+    pub(crate) extraction: extraction_workflow::State,
     pub piano_roll_clipboard: Vec<PlayedChop>,
     recording_project: u64,
     recorded_gates: HashMap<(u32, ChopInput), u64>,
@@ -298,6 +303,7 @@ pub struct App {
     pub bar: usize,
     pub bar_clipboard: Option<BarContent>,
     pub drum_templates: Option<crate::ui::drum_templates::Browser>,
+    pub(crate) sequence_tool: Option<crate::ui::sequencer::Tool>,
     pub variations: Option<crate::ui::variation::Dialog>,
     pub snapshot_dialog: Option<crate::ui::snapshots::Dialog>,
     pub snapshots: Arc<Vec<crate::model::snapshot::NamedSnapshot>>,
@@ -307,13 +313,15 @@ pub struct App {
     snapshot_preview: Option<([Arc<Clip>; 2], [f32; 2])>,
     pub taps: Vec<Instant>,
     pub status: Option<(String, bool)>,
+    pub library_recovery: Option<Arc<files::LibraryRecovery>>,
+    library_persistence: library_persistence::Persistence,
     pub busy: Option<(&'static str, Receiver<Result<Job, String>>)>,
     rng: u64,
 }
 
 impl App {
     pub fn new(ctx: egui::Context) -> Self {
-        let library = files::read_library();
+        let (library, library_recovery) = files::read_library();
         library.interface.apply(&ctx);
         let (output, audio_error) = match Output::open(&library.audio) {
             Ok(output) => (Some(output), None),
@@ -327,10 +335,13 @@ impl App {
             session: project_session::Session::new(
                 Project::default(),
                 rng,
+                ctx.clone(),
             ),
             pending_change: None,
             discard_after_analysis: false,
+            finishing_close: false,
             closing: false,
+            library_persistence: library_persistence::Persistence::new(ctx.clone()),
             ctx,
             page: Page::Dig,
             show_commands: false,
@@ -393,6 +404,7 @@ impl App {
             samples_in_project: false,
             sent: Studio::default(),
             library,
+            library_recovery: library_recovery.map(Arc::new),
             collection: None,
             new_collection: None,
             youtube_url: None,
@@ -436,6 +448,7 @@ impl App {
             quantize: Quantize::Off,
             piano_roll: None,
             transcription: Default::default(),
+            extraction: Default::default(),
             piano_roll_clipboard: Vec::new(),
             recording_project: 0,
             recorded_gates: HashMap::new(),
@@ -472,6 +485,7 @@ impl App {
             bar: 0,
             bar_clipboard: None,
             drum_templates: None,
+            sequence_tool: None,
             variations: None,
             snapshot_dialog: None,
             snapshots: Arc::default(),
@@ -522,6 +536,7 @@ impl App {
         if index == self.active_source || index > self.studio.sources.len() {
             return;
         }
+        self.clear_extraction();
         self.active_source = index;
         self.waveform = WaveformView::default();
         self.suggestions.clear();
@@ -669,10 +684,8 @@ impl App {
         if self.busy.is_some() {
             return;
         }
-        if name != "Saving recovery snapshot…" {
-            self.status = None;
-            self.retry_job = None;
-        }
+        self.status = None;
+        self.retry_job = None;
         let (tx, rx) = mpsc::channel();
         let ctx = self.ctx.clone();
         self.busy = Some((name, rx));
@@ -863,7 +876,6 @@ impl App {
                     self.continue_change(false);
                 }
             }
-            Job::RecoveryWritten(snapshot) => self.session.recovery_written(snapshot),
             Job::Folder(records) => {
                 let total = records.len();
                 self.folder = records;
@@ -1033,6 +1045,7 @@ impl App {
     fn set_record(&mut self, record: Option<Record>, clip: Option<Clip>, mut studio: Studio) {
         self.reset_analysis();
         self.clear_transcription();
+        self.clear_extraction();
         self.stop_beat_audition();
         self.groove_editor = Default::default();
         self.scene_active = None;
@@ -1603,6 +1616,7 @@ impl App {
     }
 
     fn stop_listening(&mut self) {
+        self.extraction.playing = false;
         self.queue_playing = None;
         self.send(Command::StopListening);
         self.queue_preview_started = None;
@@ -1758,10 +1772,10 @@ impl App {
 
     pub fn finish_input(&mut self) {
         let Some(recording) = self.input_recording.take() else { return };
-        let reason = recording.stop_reason();
         let title = format!("Input recording · {}", recording.name);
         self.send(Command::InputMonitor(None));
-        if let Some(clip) = recording.finish() {
+        let (clip, reason) = recording.finish();
+        if let Some(clip) = clip {
             let record = Record {
                 title, artist: "Project audio".into(), genre: String::new(),
                 source: Source::Generated(self.random()), release: None,
@@ -1769,7 +1783,10 @@ impl App {
             self.apply_job(Job::SourceAdded(record, clip, None));
             self.status = Some((reason.unwrap_or("Recording added to the project.").into(), false));
         } else {
-            self.status = Some(("The input did not capture any audio.".into(), true));
+            self.status = Some((
+                reason.unwrap_or("The input did not capture any audio.").into(),
+                true,
+            ));
         }
     }
 
@@ -2497,7 +2514,10 @@ impl App {
 
     fn open_project(&mut self, path: PathBuf, kind: OpenKind) {
         self.submit_controlled("Opening project…", move || {
-            let (project, clip) = files::open_project(&path)?;
+            let (project, clip) = match kind {
+                OpenKind::Recovery => files::recovery::open(&path)?,
+                _ => files::open_project(&path)?,
+            };
             Ok(Job::Opened(Box::new(project), clip, path, kind))
         });
     }
@@ -2633,7 +2653,9 @@ impl App {
     }
 
     fn continue_change(&mut self, discard: bool) {
-        if matches!(self.pending_change, Some(PendingChange::Quit)) && self.analysis_job().is_some() {
+        if matches!(self.pending_change, Some(PendingChange::Quit))
+            && (self.analysis_job().is_some() || self.extraction_job().is_some())
+        {
             self.discard_after_analysis |= discard;
             return;
         }
@@ -2643,30 +2665,40 @@ impl App {
             }
             match change {
                 PendingChange::Replace(job) => self.apply_job(*job),
-                PendingChange::Quit => {
-                    self.closing = true;
-                    self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
+                PendingChange::Quit => self.finish_close(),
             }
         }
     }
 
-    fn autosave(&mut self) {
-        if self.busy.is_some() || self.input_recording.is_some() || self.pending_change.is_some() || self.closing {
-            return;
-        }
-        let Some(path) = self.session.recovery_target() else { return };
-        let snapshot = self.session.current.clone();
-        let clip = self.clip.clone();
-        self.submit("Saving recovery snapshot…", move || {
-            std::fs::create_dir_all(path.parent().expect("recovery directory"))?;
-            files::save_project(&path, &snapshot, clip.as_deref())?;
-            Ok(Job::RecoveryWritten(snapshot))
-        });
+    fn finish_close(&mut self) {
+        self.finishing_close = true;
+        self.session.clear_recovery();
+        self.ctx.request_repaint();
     }
 
     fn project_dialogs(&mut self, ctx: &egui::Context) {
-        if self.pending_change.is_some() {
+        if self.finishing_close {
+            crate::ui::responsive_modal(ctx, "flush_local_data", 465.0, |ui| {
+                if let Some(error) = self.crate_save_error().filter(|_| !self.library_persistence.pending()) {
+                    ui.heading("Could not save crate changes");
+                    ui.label(error);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Retry save").clicked() {
+                            self.retry_crate_save();
+                        }
+                        if ui.button("Close without saving crate").clicked() {
+                            self.library_persistence.error = None;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.finishing_close = false;
+                        }
+                    });
+                } else {
+                    ui.spinner();
+                    ui.label("Finishing local saves…");
+                }
+            });
+        } else if self.pending_change.is_some() {
             let mut cancel = false;
             let modal = crate::ui::responsive_modal(ctx, "unsaved_project", 465.0, |ui| {
                 if self.discard_after_analysis {
@@ -2800,6 +2832,8 @@ impl App {
                     beat_python: None,
                     search_python: None,
                     pitch_python: None,
+                    sam_python: None,
+                    sam_ffmpeg: None,
                     taste: Default::default(),
                     sample_banks: self
                         .library
@@ -2841,7 +2875,7 @@ impl App {
         self.read_recorded_chops();
         self.sync();
         if !self.studio.sources.is_empty()
-            || self.record.as_ref().is_some_and(|record| matches!(record.source, Source::Generated(_)))
+            || self.record.as_ref().is_some_and(|record| matches!(record.source, Source::Generated(_) | Source::Extracted(_)))
         {
             self.status = Some(("Save the project to keep its embedded sources.".into(), false));
             return;
@@ -2888,8 +2922,55 @@ impl App {
     }
 
     pub fn persist_library(&mut self) {
-        if let Err(error) = files::write_library(&self.library) {
-            self.status = Some((format!("Could not save crate: {error}"), true));
+        if self.library_recovery.is_some() {
+            self.status = Some(("Crate changes are session-only until recovery.".into(), true));
+            return;
+        }
+        self.library_persistence.changed();
+    }
+
+    pub fn crate_save_error(&self) -> Option<&str> {
+        self.library_persistence.error.as_deref()
+    }
+
+    pub fn retry_crate_save(&mut self) {
+        self.library_persistence.retry();
+    }
+
+    pub fn restoring_library(&self) -> bool {
+        self.library_persistence.restoring()
+    }
+
+    pub fn restore_library(&mut self) {
+        let Some(recovery) = &self.library_recovery else {
+            return;
+        };
+        if let Err(error) = self.library_persistence.restore(recovery.clone()) {
+            self.status = Some((format!("Could not restore the crate backup: {error}"), true));
+        }
+    }
+
+    fn poll_library_persistence(&mut self) {
+        let Some(result) = self.library_persistence.poll(
+            &self.ctx, &self.library, self.finishing_close,
+        ) else {
+            return;
+        };
+        self.ctx.request_repaint();
+        match result {
+            Ok(preserved) => {
+                self.library_recovery = None;
+                let message = preserved.map_or_else(
+                    || "Crate backup restored.".into(),
+                    |path| {
+                        format!("Crate backup restored. Damaged file kept at {}.", path.display())
+                    },
+                );
+                self.status = Some((message, false));
+            }
+            Err(error) => {
+                self.status = Some((format!("Could not restore the crate backup: {error}"), true));
+            }
         }
     }
 
@@ -3163,6 +3244,7 @@ impl App {
         }
         if let Some(output) = &mut self.output {
             output.performance.poll();
+            output.retire_settings();
         }
         let Some(preview) = self.output.as_ref().and_then(|output| output.performance.preview())
         else {
@@ -3994,6 +4076,7 @@ impl App {
             || self.midi_dialog
             || self.piano_roll.is_some()
             || self.transcription.editor.is_some()
+            || self.sequence_tool.is_some()
         {
             return;
         }
@@ -4192,7 +4275,7 @@ impl eframe::App for App {
         {
             self.finish_input();
         }
-        if self.pending_change.is_none() && !self.session.show_recovery {
+        if !self.finishing_close && self.pending_change.is_none() && !self.session.show_recovery {
             self.poll_midi();
         }
         let dropped = ctx.input(|input| {
@@ -4205,6 +4288,7 @@ impl eframe::App for App {
         if let Some(path) = dropped
             && self.youtube_url.is_none()
             && self.pending_change.is_none()
+            && !self.finishing_close
             && !self.session.show_recovery
         {
             if path
@@ -4217,7 +4301,7 @@ impl eframe::App for App {
             }
         }
         let was_recording = self.recording;
-        if self.pending_change.is_none() && !self.session.show_recovery {
+        if !self.finishing_close && self.pending_change.is_none() && !self.session.show_recovery {
             self.shortcuts(ctx);
         }
         crate::ui::draw(self, ctx);
@@ -4250,34 +4334,52 @@ impl eframe::App for App {
         self.poll_sample_search();
         self.poll_taste();
         self.poll_transcription();
+        self.poll_extraction();
         if !self.closing && ctx.input(|input| input.viewport().close_requested()) {
-            if let Some(job) = &self.job_control {
-                job.cancel();
-            }
-            self.reset_analysis();
-            self.stop_beat_audition();
-            self.close_sample_search();
-            self.clear_transcription();
-            if self.session.dirty() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.stop_recording();
-                self.pending_change.get_or_insert(PendingChange::Quit);
-            } else if self.busy.is_some() || self.analysis_job().is_some() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.pending_change.get_or_insert(PendingChange::Quit);
-            } else {
-                self.session.clear_recovery();
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if !self.finishing_close {
+                if let Some(job) = &self.job_control {
+                    job.cancel();
+                }
+                self.reset_analysis();
+                self.stop_beat_audition();
+                self.close_sample_search();
+                self.clear_transcription();
+                self.clear_extraction();
+                if self.session.dirty() {
+                    self.stop_recording();
+                    self.pending_change.get_or_insert(PendingChange::Quit);
+                } else if self.busy.is_some() || self.analysis_job().is_some() || self.extraction_job().is_some() {
+                    self.pending_change.get_or_insert(PendingChange::Quit);
+                } else {
+                    self.finish_close();
+                }
             }
         }
-        if self.busy.is_none() && self.analysis_job().is_none()
+        if self.busy.is_none() && self.analysis_job().is_none() && self.extraction_job().is_none()
             && (!self.session.dirty() || self.discard_after_analysis)
             && matches!(self.pending_change, Some(PendingChange::Quit))
         {
-            self.session.clear_recovery();
             let discard = std::mem::take(&mut self.discard_after_analysis);
             self.continue_change(discard);
         }
-        self.autosave();
+        let recovery_enabled = self.input_recording.is_none()
+            && self.pending_change.is_none()
+            && !self.finishing_close;
+        if let Some(error) = self.session.autosave(self.clip.as_ref(), recovery_enabled) {
+            self.status = Some((error, true));
+            ctx.request_repaint();
+        }
+        self.poll_library_persistence();
+        if self.finishing_close
+            && !self.closing
+            && !self.session.cleaning_recovery()
+            && !self.library_persistence.pending()
+            && self.crate_save_error().is_none()
+        {
+            self.closing = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         if self.clip.is_some()
             || self.input_recording.is_some()
             || self.session.dirty()
@@ -4289,6 +4391,7 @@ impl eframe::App for App {
             || self.search_job().is_some()
             || self.taste_waiting()
             || self.transcription_job().is_some()
+            || self.extraction_job().is_some()
         {
             ctx.request_repaint_after(Duration::from_millis(33));
         }

@@ -101,6 +101,21 @@ pub enum Source {
     YouTube { id: String },
     Commons { media: String, page: String },
     Generated(u64),
+    Extracted(Box<ExtractionOrigin>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ExtractionOrigin {
+    pub id: u64,
+    pub parent_id: u64,
+    pub parent_title: String,
+    pub start_frame: usize,
+    pub end_frame: usize,
+    pub sample_rate: u32,
+    pub prompt: String,
+    pub model: String,
+    pub revision: String,
+    pub residual: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1804,7 +1819,7 @@ pub struct SampleBank {
     pub samples: Vec<NamedSample>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DawTarget {
     pub path: PathBuf,
     pub enabled: bool,
@@ -1821,7 +1836,7 @@ pub struct DigPreset {
     pub label: String,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Library {
     #[serde(default, skip_serializing_if = "crate::audio::OutputSettings::is_default")]
     pub audio: crate::audio::OutputSettings,
@@ -1850,6 +1865,10 @@ pub struct Library {
     pub search_python: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pitch_python: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sam_python: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sam_ffmpeg: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "crate::recommendations::Profile::is_default")]
     pub taste: crate::recommendations::Profile,
 }

@@ -2,15 +2,17 @@ use crate::{
     audio::Clip,
     files::{self, Result},
     model::{Record, Source},
+    subprocess::{self, Capture},
 };
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
     env, fs,
     hash::{DefaultHasher, Hash, Hasher},
-    io::{BufReader, ErrorKind},
+    io::BufReader,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
+    time::Duration,
 };
 use url::Url;
 
@@ -205,7 +207,7 @@ fn title_decade(title: &str) -> Option<u16> {
 fn search(query: &str) -> Result<SearchResults> {
     crate::background::stage("Searching YouTube")?;
     let search_url = format!("ytsearch32:{query}");
-    let output = run(
+    let output = run_downloader(
         yt_dlp()?.args([
             "--flat-playlist",
             "--skip-download",
@@ -214,6 +216,8 @@ fn search(query: &str) -> Result<SearchResults> {
             &search_url,
         ]),
         "YouTube search",
+        Duration::from_secs(90),
+        8 * 1024 * 1024,
     )?;
     Ok(serde_json::from_slice(&output)?)
 }
@@ -537,7 +541,7 @@ pub(crate) fn downloader() -> Option<PathBuf> {
 fn yt_dlp() -> Result<Command> {
     let executable = downloader().ok_or("YouTube needs yt-dlp on your PATH.")?;
     let mut command = Command::new(executable);
-    command.stdin(Stdio::null()).args([
+    command.args([
         "--ignore-config",
         "--no-plugin-dirs",
         "--no-update",
@@ -547,18 +551,13 @@ fn yt_dlp() -> Result<Command> {
         "--retries",
         "1",
     ]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
     Ok(command)
 }
 
 fn download(url: &str, directory: &Path) -> Result<()> {
     crate::background::stage("Downloading source audio")?;
     let mut command = yt_dlp()?;
-    command.current_dir(directory).stdout(Stdio::null()).args([
+    command.current_dir(directory).args([
         "--no-playlist",
         "--js-runtimes",
         "node",
@@ -576,38 +575,14 @@ fn download(url: &str, directory: &Path) -> Result<()> {
         "--",
         url,
     ]);
-    run(&mut command, "YouTube import")?;
+    run_downloader(&mut command, "YouTube import", Duration::from_secs(300), 0)?;
     Ok(())
 }
 
-fn run(command: &mut Command, operation: &str) -> Result<Vec<u8>> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut stdout = tempfile::tempfile()?;
-    let mut stderr = tempfile::tempfile()?;
-    let mut child = command.stdout(stdout.try_clone()?).stderr(stderr.try_clone()?).spawn().map_err(|error| {
-        if error.kind() == ErrorKind::NotFound {
-            "Could not start yt-dlp. Check that it is installed and available on PATH.".to_owned()
-        } else {
-            format!("Could not start yt-dlp: {error}")
-        }
-    })?;
-    let status = loop {
-        match crate::background::check().and_then(|_| child.try_wait()) {
-            Ok(Some(status)) => break status,
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(80)),
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error.into());
-            }
-        }
-    };
-    if !status.success() {
-        let start = stderr.metadata()?.len().saturating_sub(16 * 1024);
-        stderr.seek(SeekFrom::Start(start))?;
-        let mut bytes = Vec::new();
-        stderr.read_to_end(&mut bytes)?;
-        let stderr = String::from_utf8_lossy(&bytes);
+fn run_downloader(command: &mut Command, operation: &str, timeout: Duration, stdout: usize) -> Result<Vec<u8>> {
+    let output = subprocess::run(command, operation, timeout, Capture { stdout, stderr: 16 * 1024 })?;
+    if !output.status.success() {
+        let stderr = output.stderr;
         let message = stderr
             .lines()
             .rev()
@@ -616,10 +591,7 @@ fn run(command: &mut Command, operation: &str) -> Result<Vec<u8>> {
             .unwrap_or("The downloader did not return an error message.");
         return Err(format!("{operation} failed. {message}").into());
     }
-    stdout.rewind()?;
-    let mut bytes = Vec::new();
-    stdout.take(8 * 1024 * 1024).read_to_end(&mut bytes)?;
-    Ok(bytes)
+    Ok(output.stdout)
 }
 
 #[cfg(test)]

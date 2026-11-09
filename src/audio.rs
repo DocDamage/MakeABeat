@@ -15,8 +15,11 @@ use std::sync::{
     mpsc::{self, Receiver, Sender},
 };
 
+pub(crate) mod commands;
 mod melody;
 mod mono;
+#[cfg(all(test, windows))]
+mod soak;
 
 pub type Frame = [f32; 2];
 pub const RENDER_RATE: u32 = 48_000;
@@ -27,6 +30,7 @@ const SEQUENCED_KEY: u64 = u64::MAX;
 pub struct Clip {
     pub rate: u32,
     pub frames: Arc<[Frame]>,
+    audio_id: Arc<()>,
     pub sources: Vec<Arc<Clip>>,
     pub peaks: Vec<f32>,
     detail_peaks: Vec<Frame>,
@@ -40,10 +44,15 @@ impl Clip {
         Self {
             rate,
             frames: frames.into(),
+            audio_id: Arc::new(()),
             sources: Vec::new(),
             peaks,
             detail_peaks,
         }
+    }
+
+    pub(crate) fn audio_id(&self) -> std::sync::Weak<()> {
+        Arc::downgrade(&self.audio_id)
     }
 
     pub fn source(&self, index: usize) -> Option<&Clip> {
@@ -620,6 +629,10 @@ pub struct Meters {
     pub callback_frames: AtomicUsize,
     #[cfg(all(test, windows))]
     pub callback_peak_ns: AtomicU64,
+    #[cfg(all(test, windows))]
+    callback_over_budget: AtomicU64,
+    #[cfg(all(test, windows))]
+    soak_probe: std::sync::OnceLock<soak::RenderProbe>,
     position: AtomicU64,
     step: AtomicI32,
     preview: AtomicBool,
@@ -700,7 +713,8 @@ pub fn output_devices() -> Vec<String> {
 
 pub struct Output {
     _stream: Stream,
-    tx: Sender<Command>,
+    tx: commands::CommandSender,
+    retired_settings: Receiver<Box<Studio>>,
     recorded: Receiver<CapturedChop>,
     pub performance: performance_capture::History,
     pub meters: Arc<Meters>,
@@ -743,7 +757,7 @@ impl Output {
             }
             config.buffer_size = cpal::BufferSize::Fixed(frames);
         }
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx, retired_settings) = commands::channel();
         let (capture, recorded) = mpsc::channel();
         let (performance_input, performance) = performance_capture::channel();
         let meters = Arc::new(Meters::default());
@@ -761,6 +775,7 @@ impl Output {
         Ok(Self {
             _stream: stream,
             tx,
+            retired_settings,
             recorded,
             performance,
             meters,
@@ -776,7 +791,7 @@ impl Output {
         if matches!(&command, Command::Clip(_)) {
             self.performance.invalidate_preview();
         }
-        let _ = self.tx.send(command);
+        self.tx.send(command);
     }
 
     pub fn queue_beat_audition(&self, clip: Arc<Clip>, range: (f64, f64), bars: Option<usize>) {
@@ -792,8 +807,12 @@ impl Output {
         self.audition_clips.borrow_mut().retain(|(serial, _)| *serial >= watermark);
     }
 
-    pub fn sender(&self) -> Sender<Command> {
+    pub(crate) fn sender(&self) -> commands::CommandSender {
         self.tx.clone()
+    }
+
+    pub fn retire_settings(&self) {
+        self.retired_settings.try_iter().for_each(drop);
     }
 
     pub fn recorded(&self) -> Option<CapturedChop> {
@@ -804,28 +823,48 @@ impl Output {
 fn output_stream<T: SizedSample + FromSample<f32>>(
     device: &cpal::Device,
     config: &StreamConfig,
-    rx: Receiver<Command>,
+    mut rx: commands::CommandReceiver,
     meters: &Arc<Meters>,
     capture: Sender<CapturedChop>,
     performance: performance_capture::Input,
 ) -> Result<Stream, cpal::BuildStreamError> {
     let channels = usize::from(config.channels);
+    #[cfg(all(test, windows))]
+    let config_rate = config.sample_rate.0;
     let mut mixer = Mixer::new(config.sample_rate.0);
     mixer.capture = Some(capture);
     mixer.retrospective = Some(performance);
     let status = Arc::clone(meters);
     let error_status = Arc::clone(meters);
+    #[cfg(all(test, windows))]
+    let mut diagnostic = soak::RenderState::new(config.sample_rate.0);
+    #[cfg(windows)]
+    let mut promote = true;
     device.build_output_stream(
         config,
         move |data: &mut [T], _| {
+            #[cfg(windows)]
+            if std::mem::take(&mut promote) {
+                crate::platform::promote_audio_thread();
+            }
             #[cfg(all(test, windows))]
             let started = std::time::Instant::now();
-            for command in rx.try_iter() {
-                mixer.command(command);
-            }
+            #[cfg(all(test, windows))]
+            let probe = status.soak_probe.get();
+            #[cfg(all(test, windows))]
+            let cycles = probe.map(|_| soak::thread_cycles());
+            rx.apply(&mut mixer);
+            #[cfg(all(test, windows))]
+            let commands_elapsed = started.elapsed();
             let mut peak = 0.0_f32;
             for output in data.chunks_exact_mut(channels) {
                 let [left, right] = mixer.next_frame();
+                #[cfg(all(test, windows))]
+                let (left, right) = if let Some(probe) = probe {
+                    diagnostic.add_reference(probe, left, right)
+                } else {
+                    (left, right)
+                };
                 peak = peak.max(mixer.unlimited_peak);
                 output[0] = T::from_sample(if channels == 1 {
                     (left + right) * 0.5
@@ -839,6 +878,8 @@ fn output_stream<T: SizedSample + FromSample<f32>>(
                     *channel = T::from_sample(0.0);
                 }
             }
+            #[cfg(all(test, windows))]
+            let mix_elapsed = started.elapsed();
             if let Some(capture) = &mixer.retrospective {
                 capture.publish();
             }
@@ -860,8 +901,16 @@ fn output_stream<T: SizedSample + FromSample<f32>>(
             status.audition_watermark.store(watermark, std::sync::atomic::Ordering::Release);
             #[cfg(all(test, windows))]
             {
-                status.callback_frames.store(data.len() / channels, Relaxed);
-                status.callback_peak_ns.fetch_max(started.elapsed().as_nanos() as u64, Relaxed);
+                let frames = data.len() / channels;
+                let elapsed_ns = started.elapsed().as_nanos() as u64;
+                status.callback_frames.store(frames, Relaxed);
+                status.callback_peak_ns.fetch_max(elapsed_ns, Relaxed);
+                if elapsed_ns * u64::from(config_rate) > frames as u64 * 1_000_000_000 {
+                    status.callback_over_budget.fetch_add(1, Relaxed);
+                }
+                if let (Some(probe), Some(cycles)) = (probe, cycles) {
+                    diagnostic.callback(probe, started, frames, config_rate, commands_elapsed, mix_elapsed, elapsed_ns, cycles);
+                }
             }
         },
         move |_| error_status.failed.store(true, Relaxed),
@@ -1434,6 +1483,25 @@ impl Mixer {
         }
     }
 
+    fn replace_settings(&mut self, settings: &mut Studio) {
+        if self.settings.bpm != settings.bpm && !self.external_clock {
+            self.stop_beat_audition();
+        }
+        let instruments_changed = !self.settings.same_capture_instruments(settings);
+        if instruments_changed {
+            if let Some(capture) = &mut self.retrospective {
+                capture.reset();
+            }
+            if self.settings.instruments.glide.mono || settings.instruments.glide.mono {
+                self.mono.clear();
+                if settings.chromatic_enabled && settings.instruments.glide.mono {
+                    self.piano.clear();
+                }
+            }
+        }
+        std::mem::swap(&mut self.settings, settings);
+    }
+
     pub fn command(&mut self, command: Command) {
         match command {
             Command::Clip(clip) => {
@@ -1466,25 +1534,7 @@ impl Mixer {
                     self.pad_tails.clear();
                 }
             }
-            Command::Settings(settings) => {
-                if self.settings.bpm != settings.bpm && !self.external_clock {
-                    self.stop_beat_audition();
-                }
-                if let Some(capture) = &mut self.retrospective
-                    && !self.settings.same_capture_instruments(&settings)
-                {
-                    capture.reset();
-                }
-                if (self.settings.instruments.glide.mono || settings.instruments.glide.mono)
-                    && !self.settings.same_capture_instruments(&settings)
-                {
-                    self.mono.clear();
-                    if settings.chromatic_enabled && settings.instruments.glide.mono {
-                        self.piano.clear();
-                    }
-                }
-                self.settings = *settings;
-            }
+            Command::Settings(mut settings) => self.replace_settings(&mut settings),
             Command::Play(play) => {
                 self.pattern_preview = false;
                 self.chop = None;

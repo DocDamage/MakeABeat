@@ -1,4 +1,4 @@
-use crate::audio::Command;
+use crate::audio::{Command, commands::CommandSender};
 use eframe::egui;
 use midir::{Ignore, MidiInput, MidiInputConnection};
 use serde::{Deserialize, Serialize};
@@ -258,7 +258,7 @@ pub struct PortSettings {
     pub soft_takeover: bool,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub ports: HashMap<String, PortSettings>,
@@ -378,7 +378,7 @@ impl Clock {
 #[derive(Default)]
 struct ClockLink {
     port: Option<u64>,
-    output: Option<Sender<Command>>,
+    output: Option<CommandSender>,
     timing: Clock,
     fallback_period: f64,
 }
@@ -401,7 +401,7 @@ impl ClockLink {
             _ => return Some(Event::Message(connection, message)),
         };
         if let Some(output) = &self.output {
-            let _ = output.send(command);
+            output.send(command);
         }
         Some(Event::Clock(connection, message, period))
     }
@@ -429,12 +429,12 @@ impl Input {
         let _ = self.configure.send(settings.disabled());
     }
 
-    pub fn route_clock(&self, port: Option<u64>, output: Option<Sender<Command>>, bpm: u16) {
+    pub(crate) fn route_clock(&self, port: Option<u64>, output: Option<CommandSender>, bpm: u16) {
         let Ok(mut clock) = self.clock.lock() else {
             return;
         };
         if let Some(output) = &output {
-            let _ = output.send(Command::ClockMode(port.is_some()));
+            output.send(Command::ClockMode(port.is_some()));
         }
         *clock = ClockLink {
             port,
@@ -543,7 +543,7 @@ mod tests {
     #[ignore = "requires a Windows MIDI loopback named Lost Samples MIDI QA"]
     fn windows_port_reports_its_name_delivers_messages_and_disconnects() {
         let input = Input::start(egui::Context::default(), HashSet::new());
-        let (audio, commands) = mpsc::channel();
+        let (audio, mut commands, _retired) = crate::audio::commands::channel();
         let mut connection = None;
         let mut got_note = false;
         let mut got_control = false;
@@ -577,7 +577,15 @@ mod tests {
             }
         }
         assert!(got_note && got_control && disconnected);
-        let commands: Vec<_> = commands.try_iter().collect();
+        let mut received = Vec::new();
+        loop {
+            let batch = commands.take_commands();
+            if batch.is_empty() {
+                break;
+            }
+            received.extend(batch);
+        }
+        let commands = received;
         assert!(
             commands
                 .iter()

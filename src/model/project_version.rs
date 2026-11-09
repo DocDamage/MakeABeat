@@ -1,4 +1,4 @@
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ProjectVersion {
     SingleSource,
     MultipleSources,
@@ -8,6 +8,7 @@ pub enum ProjectVersion {
     BeatMaps,
     Grooves,
     Transcription,
+    Extraction,
 }
 
 impl ProjectVersion {
@@ -21,6 +22,7 @@ impl ProjectVersion {
             b"LSFLIP06" => Ok(Self::BeatMaps),
             b"LSFLIP07" => Ok(Self::Grooves),
             b"LSFLIP08" => Ok(Self::Transcription),
+            b"LSFLIP09" => Ok(Self::Extraction),
             _ if marker.starts_with(b"LSFLIP") => {
                 Err("Unsupported Lost Samples project format. Open it in a compatible version.")
             }
@@ -38,6 +40,7 @@ impl ProjectVersion {
             Self::BeatMaps => b"LSFLIP06",
             Self::Grooves => b"LSFLIP07",
             Self::Transcription => b"LSFLIP08",
+            Self::Extraction => b"LSFLIP09",
         }
     }
 
@@ -46,7 +49,7 @@ impl ProjectVersion {
             && match self {
                 Self::SingleSource => extras == 0,
                 Self::MultipleSources => extras > 0,
-                Self::ChokeGroups | Self::Snapshots | Self::Instruments | Self::BeatMaps | Self::Grooves | Self::Transcription => true,
+                _ => true,
             }
     }
 }

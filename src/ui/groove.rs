@@ -3,7 +3,7 @@ use crate::model::{MAX_SAMPLE_NAME, STEPS, grid_edit, groove::MAX_OFFSET};
 use eframe::egui::{self, ComboBox, DragValue, Ui};
 
 pub fn panel(app: &mut App, ui: &mut Ui, sample_view: bool) {
-    ui.collapsing("Groove transfer", |ui| {
+    let mut controls = |ui: &mut Ui| {
         let mut selected = None;
         ui.horizontal_wrapped(|ui| {
             if sample_view && action(ui, "Extract from selected break", app.selection().is_some()).clicked() {
@@ -75,7 +75,12 @@ pub fn panel(app: &mut App, ui: &mut Ui, sample_view: bool) {
             if app.groove_preview_playing() && action(ui, "Stop comparison", true).clicked() { app.stop_groove_preview(); }
             if action(ui, "Apply groove", !app.recording && app.studio.has_pattern()).clicked() { app.apply_groove(); }
         });
-    });
+    };
+    if sample_view {
+        ui.collapsing("Groove transfer", controls);
+    } else {
+        controls(ui);
+    }
 }
 
 pub fn audition(app: &mut App, ui: &mut Ui) {

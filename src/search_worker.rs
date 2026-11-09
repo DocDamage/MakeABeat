@@ -1,10 +1,10 @@
-use crate::{audio::Clip, background, files::Result};
+use crate::{audio::Clip, background, files::Result, subprocess::Process};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     io::{BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{ChildStdin, Command, Stdio},
     sync::mpsc::{self, Receiver},
     time::{Duration, Instant},
 };
@@ -25,18 +25,9 @@ struct Reply {
 
 pub struct Worker {
     python: PathBuf,
-    child: Child,
+    _process: Process,
     input: ChildStdin,
     replies: Receiver<String>,
-    #[cfg(windows)]
-    _job: Option<std::os::windows::io::OwnedHandle>,
-}
-
-impl Drop for Worker {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 impl Worker {
@@ -50,16 +41,10 @@ impl Worker {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x0800_0000);
-        }
-        let mut child = command
-            .spawn()
+        let mut process = Process::spawn(&mut command)
             .map_err(|error| format!("Could not start the CLAP Python environment. {error}"))?;
-        let input = child.stdin.take().unwrap();
-        let output = child.stdout.take().unwrap();
+        let input = process.child.stdin.take().unwrap();
+        let output = process.child.stdout.take().unwrap();
         let (send, replies) = mpsc::sync_channel(2);
         std::thread::spawn(move || {
             for line in BufReader::new(output)
@@ -71,18 +56,12 @@ impl Worker {
                 }
             }
         });
-        let mut worker = Self {
+        let worker = Self {
             python: python.to_owned(),
-            child,
+            _process: process,
             input,
             replies,
-            #[cfg(windows)]
-            _job: None,
         };
-        #[cfg(windows)]
-        {
-            worker._job = Some(crate::analysis_worker::bind_worker_tree(&worker.child)?);
-        }
         let reply = worker.receive(if setup { 900 } else { 60 }, true)?;
         if reply.ready != Some(true) || reply.revision.as_deref() != Some(REVISION) {
             return Err("Unexpected CLAP worker version.".into());

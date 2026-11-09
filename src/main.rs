@@ -25,6 +25,7 @@ mod search;
 mod search_worker;
 mod separation;
 mod stretch;
+mod subprocess;
 mod tempo;
 mod transcription;
 mod ui;

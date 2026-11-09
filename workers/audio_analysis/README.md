@@ -77,3 +77,57 @@ $env:LOST_SAMPLES_PITCH_CORPUS = "C:\pitch-eval\corpus"
 $env:LOST_SAMPLES_PITCH_PYTHON = (Resolve-Path $pitchPython).Path
 cargo test --release --locked basic_pitch_evaluates_labeled_corpus -- --ignored --nocapture
 ```
+
+## SAM Audio Windows feasibility probe
+
+Use an isolated Python 3.11 environment for Phase 8. This setup uses the upstream SAM Audio source, CUDA 12.8 PyTorch wheels, and TorchCodec 0.10.0. TorchCodec needs the shared FFmpeg DLLs, which the standalone FFmpeg executable does not provide. Unpack the [FFmpeg 8.1.2 full shared build](https://www.gyan.dev/ffmpeg/builds/#release-builds) under the probe directory before running it.
+
+```powershell
+$samProbe = Join-Path $env:LOCALAPPDATA 'Lost Samples Desktop\sam-audio-phase8'
+New-Item -ItemType Directory -Force $samProbe | Out-Null
+$samSource = Join-Path $samProbe 'upstream'
+git clone https://github.com/facebookresearch/sam-audio.git $samSource
+git -C $samSource checkout bb4c6999d2677c7402360e426afc01ddfad6dce0
+uv venv --python 3.11 (Join-Path $samProbe 'venv')
+$samPython = Join-Path $samProbe 'venv\Scripts\python.exe'
+uv pip install --python $samPython --index https://download.pytorch.org/whl/cu128 --index-strategy unsafe-best-match $samSource 'torch==2.10.0+cu128' 'torchaudio==2.10.0+cu128' 'torchvision==0.25.0+cu128' 'torchcodec==0.10.0' 'transformers==4.57.6' 'soundfile==0.14.0'
+uv pip check --python $samPython
+```
+
+Request access to the [small checkpoint](https://huggingface.co/facebook/sam-audio-small) and wait for approval, then authenticate locally with a read token from the approved account. A successful sign-in alone can still return HTTP 403 for the checkpoint. The pinned checkpoint is about 5.1 GB. The upstream loader can fetch additional model dependencies during the first run.
+
+```powershell
+uvx --from huggingface-hub hf auth login --force
+uvx --from huggingface-hub hf auth whoami
+$samFfmpeg = Join-Path $samProbe 'ffmpeg-8.1.2-full_build-shared\bin'
+$env:Path = "$samFfmpeg;$env:Path"
+$samInput = Join-Path $samProbe 'probe-input.wav'
+& (Join-Path $samFfmpeg 'ffmpeg.exe') -hide_banner -loglevel error -y -f lavfi -i 'sine=frequency=440:sample_rate=48000:duration=3' -f lavfi -i 'anoisesrc=color=white:amplitude=0.12:sample_rate=48000:duration=3:seed=8' -filter_complex 'amix=inputs=2:normalize=0' $samInput
+& $samPython workers/audio_analysis/sam_audio_probe.py $samInput 'sine wave tone' (Join-Path $samProbe 'probe-output')
+```
+
+You can substitute a mono or stereo clip up to six seconds and a lowercase prompt describing the target. The six-second cap is for the probe. The text-only pass uses one candidate and skips loading the optional rankers and automatic span predictor. The script writes original, target, and residual mono WAVs at the model sample rate after validating their sample counts and finite values. It reports load time, inference time, and peak memory allocated by PyTorch on CUDA.
+
+In the app, open **Studio → Sample → Extract sound · Experimental**. The app detects the environment and shared FFmpeg folder at the paths above. If you used different paths, choose them in **SAM Audio setup**. Run the standalone probe once to cache the model and T5 encoder before extracting in the app, which uses the local cache. With a waveform selection of 0.10 to 6 seconds, enter a short description and click **Extract selection**. Preview the three mono outputs and save the target, residual, or both as project sources.
+
+### Extraction benchmark
+
+The fixed six-second suite contains four controlled mixtures with bass guitar, flute, choir as backing vocals, and synthesized kick and snare as targets. It also includes two ChoraleBricks ensemble excerpts for listening. The manifest records the sources, edits, checksums, and attribution. Downloaded and derived audio stays in the local probe directory. [ChoraleBricks](https://www.audiolabs-erlangen.de/resources/MIR/2025-ChoraleBricks)
+
+```powershell
+$samCorpus = Join-Path $samProbe 'extraction-benchmark'
+$samResults = Join-Path $samProbe 'extraction-results'
+if (!(Test-Path (Join-Path $samCorpus 'manifest.json'))) {
+    & $samPython workers/audio_analysis/sam_audio_benchmark.py prepare $samCorpus --cache (Join-Path $samProbe 'benchmark-sources') --ffmpeg (Join-Path $samFfmpeg 'ffmpeg.exe')
+    if ($LASTEXITCODE -ne 0) { throw 'Benchmark preparation failed' }
+}
+New-Item -ItemType Directory -Force $samResults | Out-Null
+foreach ($case in (Get-Content (Join-Path $samCorpus 'manifest.json') -Raw | ConvertFrom-Json).cases) {
+    $mix = Join-Path $samCorpus "$($case.id)\mix.wav"
+    & $samPython workers/audio_analysis/sam_audio_probe.py $mix $case.prompt (Join-Path $samResults $case.id)
+    if ($LASTEXITCODE -ne 0) { throw "Extraction failed for $($case.id)" }
+}
+& $samPython workers/audio_analysis/sam_audio_benchmark.py score $samCorpus $samResults
+```
+
+For each controlled mixture, record wanted and unwanted gain independently for the target and residual. The scorer fits the output to both aligned reference stems and reports the remaining error relative to the wanted stem. It also checks the summed outputs against the input. For a listening pass, compare the original, target, and residual at matched levels. Rate isolation and damage separately for each prompt. Check whether the full wanted phrase is recognizable, whether the strongest competing instrument dropped, and whether the output introduced obvious artifacts or lost wanted notes. Report per-case failures and per-run latency and CUDA memory.

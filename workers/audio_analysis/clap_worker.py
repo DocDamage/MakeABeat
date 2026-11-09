@@ -39,7 +39,7 @@ def serve():
     torch.set_num_threads(4)
     torch.set_num_interop_threads(1)
     try:
-        folder = snapshot_download(MODEL, revision=REVISION, local_files_only=True)
+        folder = snapshot_download(MODEL, revision=REVISION, allow_patterns=FILES, local_files_only=True)
         processor = ClapProcessor.from_pretrained(folder, local_files_only=True)
         model = ClapModel.from_pretrained(folder, local_files_only=True, use_safetensors=False).eval()
     except OSError as error:

@@ -6,6 +6,7 @@ use crate::{
         beat_map::{Beat, MAX_BEATS, Provenance},
         snapshot::SourceId,
     },
+    subprocess::Process,
 };
 use ring::digest::{Context, SHA256};
 use serde::{Deserialize, Serialize};
@@ -13,7 +14,7 @@ use std::{
     fs::{self, File},
     io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
     sync::mpsc,
     time::{Duration, Instant},
 };
@@ -409,54 +410,8 @@ fn write_cache(path: &Path, proposal: &Proposal) -> Result<()> {
     Ok(())
 }
 
-struct Worker {
-    child: Child,
-    #[cfg(windows)]
-    _job: Option<std::os::windows::io::OwnedHandle>,
-}
-
-impl Drop for Worker {
-    fn drop(&mut self) {
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
-}
-
-#[cfg(windows)]
-pub(crate) fn bind_worker_tree(child: &Child) -> Result<std::os::windows::io::OwnedHandle> {
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use windows::{
-        Win32::{
-            Foundation::HANDLE,
-            System::JobObjects::{
-                AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-                SetInformationJobObject,
-            },
-        },
-        core::PCWSTR,
-    };
-    unsafe {
-        let job = CreateJobObjectW(None, PCWSTR::null())?;
-        let owner = OwnedHandle::from_raw_handle(job.0);
-        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(
-            job,
-            JobObjectExtendedLimitInformation,
-            std::ptr::from_ref(&limits).cast(),
-            std::mem::size_of_val(&limits) as u32,
-        )?;
-        AssignProcessToJobObject(job, HANDLE(child.as_raw_handle()))?;
-        Ok(owner)
-    }
-}
-
 fn supervise(mut command: Command, request: &Request) -> Result<Vec<Beat>> {
     background::stage("Starting local analysis worker")?;
-    let log = request.output_dir.join("worker.log");
     let python = request.identity.model_id == "beat-this";
     if python {
         // The Windows venv launcher can buffer redirected stdin until EOF.
@@ -468,26 +423,9 @@ fn supervise(mut command: Command, request: &Request) -> Result<Vec<Beat>> {
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(File::create(&log)?);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000);
-    }
-    let mut worker = Worker {
-        child: command
-            .spawn()
-            .map_err(|error| format!("Could not start local analysis worker. {error}"))?,
-        #[cfg(windows)]
-        _job: None,
-    };
-    #[cfg(windows)]
-    if python {
-        worker._job =
-            Some(bind_worker_tree(&worker.child).map_err(|error| {
-                format!("Could not supervise the Python process tree. {error}")
-            })?);
-    }
+        .stderr(Stdio::null());
+    let mut worker = Process::spawn(&mut command)
+        .map_err(|error| format!("Could not start local analysis worker. {error}"))?;
     let mut input = worker
         .child
         .stdin
@@ -520,13 +458,13 @@ fn supervise(mut command: Command, request: &Request) -> Result<Vec<Beat>> {
     loop {
         if let Err(error) = background::check() {
             if contacted && let Some(input) = input.take() {
-                signal_cancel(input, request.job_id, &mut worker.child);
+                signal_cancel(input, request.job_id, &mut worker);
             }
             return Err(error.into());
         }
         if Instant::now() >= deadline {
             if contacted && let Some(input) = input.take() {
-                signal_cancel(input, request.job_id, &mut worker.child);
+                signal_cancel(input, request.job_id, &mut worker);
             }
             return Err("Local analysis timed out.".into());
         }
@@ -570,7 +508,7 @@ fn supervise(mut command: Command, request: &Request) -> Result<Vec<Beat>> {
             }
             Ok(Err(error)) => return Err(error.into()),
             Ok(Ok(None)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                if let Some(exit) = worker.child.try_wait()? {
+                if let Some(exit) = worker.try_wait()? {
                     if exit.success()
                         && let Some(beats) = terminal
                     {
@@ -588,7 +526,7 @@ fn supervise(mut command: Command, request: &Request) -> Result<Vec<Beat>> {
     }
 }
 
-fn signal_cancel(mut input: impl Write, job_id: u64, child: &mut Child) {
+fn signal_cancel(mut input: impl Write, job_id: u64, process: &mut Process) {
     let message = Cancel {
         version: VERSION,
         kind: "cancel".into(),
@@ -597,7 +535,7 @@ fn signal_cancel(mut input: impl Write, job_id: u64, child: &mut Child) {
     if serde_json::to_writer(&mut input, &message).is_ok() && input.write_all(b"\n").is_ok() {
         drop(input);
         let deadline = Instant::now() + Duration::from_millis(120);
-        while Instant::now() < deadline && child.try_wait().ok().flatten().is_none() {
+        while Instant::now() < deadline && process.try_wait().ok().flatten().is_none() {
             std::thread::sleep(Duration::from_millis(15));
         }
     }

@@ -21,6 +21,7 @@ use symphonia::core::{
 };
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
+pub mod recovery;
 pub const AUDIO_EXTENSIONS: &[&str] = &["wav", "mp3", "flac", "ogg", "m4a", "aac"];
 const MAX_FRAMES: usize = 25_000_000;
 const MAX_DOWNLOAD: usize = 30 * 1024 * 1024;
@@ -161,7 +162,9 @@ pub fn load(record: &Record) -> Result<(Clip, u16)> {
         Source::Demo(id) if *id < DEMOS.len() => Ok((demo(*id), DEMOS[*id].2)),
         Source::Demo(_) => Err("Unknown demo recording".into()),
         Source::Commons { media, .. } => Ok((download(media)?, 90)),
-        Source::Generated(_) => Err("Open the project to load its generated audio.".into()),
+        Source::Generated(_) | Source::Extracted(_) => {
+            Err("Open the project to load its generated audio.".into())
+        }
     }
 }
 
@@ -357,6 +360,13 @@ pub struct Project {
     pub snapshots: Arc<Vec<crate::model::snapshot::NamedSnapshot>>,
 }
 
+impl Project {
+    fn uses_extraction(&self) -> bool {
+        self.record.iter().chain(&self.studio.sources)
+            .any(|record| matches!(record.source, Source::Extracted(_)))
+    }
+}
+
 pub fn publish_export(path: &Path, render: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
     let directory = path.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let staging = tempfile::tempdir_in(directory)?;
@@ -398,7 +408,9 @@ pub fn save_project(path: &Path, project: &Project, clip: Option<&Clip>) -> Resu
         if has_snapshots {
             validate_snapshot_sources(project, extras + usize::from(clip.is_some()))?;
         }
-        let version = if project.studio.uses_transcription()
+        let version = if project.uses_extraction() {
+            ProjectVersion::Extraction
+        } else if project.studio.uses_transcription()
             || project.snapshots.iter().any(|snapshot| snapshot.uses_transcription())
         {
             ProjectVersion::Transcription
@@ -501,40 +513,47 @@ pub fn open_project(path: &Path) -> Result<(Project, Option<Clip>)> {
             root.sources.push(Arc::new(audio));
         }
     }
-    if matches!(version, ProjectVersion::Snapshots | ProjectVersion::Instruments | ProjectVersion::BeatMaps | ProjectVersion::Grooves | ProjectVersion::Transcription)
+    if version >= ProjectVersion::Snapshots
         && (!project.snapshots.is_empty() || !project.source_ids.is_empty())
     {
         validate_snapshot_sources(&project, extras + usize::from(clip.is_some()))?;
     } else if !project.snapshots.is_empty() || !project.source_ids.is_empty() {
         return Err("Snapshot data requires project format LSFLIP04.".into());
     }
-    if !matches!(version, ProjectVersion::Instruments | ProjectVersion::BeatMaps | ProjectVersion::Grooves | ProjectVersion::Transcription)
+    if version < ProjectVersion::Instruments
         && (project.studio.uses_instruments() || project.snapshots.iter().any(|snapshot| snapshot.uses_instruments()))
     {
         return Err("Sampler controls and event identities require project format LSFLIP05.".into());
     }
-    if !matches!(version, ProjectVersion::BeatMaps | ProjectVersion::Grooves | ProjectVersion::Transcription)
+    if version < ProjectVersion::BeatMaps
         && (project.studio.uses_beat_maps() || project.snapshots.iter().any(|snapshot| snapshot.uses_beat_maps()))
     {
         return Err("Beat maps require project format LSFLIP06.".into());
     }
-    if !matches!(version, ProjectVersion::Grooves | ProjectVersion::Transcription)
+    if version < ProjectVersion::Grooves
         && (project.studio.uses_grooves() || project.snapshots.iter().any(|snapshot| snapshot.uses_grooves()))
     {
         return Err("Grooves and per-hit timing require project format LSFLIP07.".into());
     }
-    if version != ProjectVersion::Transcription
+    if version < ProjectVersion::Transcription
         && (project.studio.uses_transcription() || project.snapshots.iter().any(|snapshot| snapshot.uses_transcription()))
     {
         return Err("Transcribed notes and pitch curves require project format LSFLIP08.".into());
     }
-    project.studio.validate_media(clip.as_ref());
-    project.studio.validate_source_analysis(clip.as_ref());
+    if version < ProjectVersion::Extraction && project.uses_extraction() {
+        return Err("Extracted sources require project format LSFLIP09.".into());
+    }
+    validate_loaded_project(&mut project, clip.as_ref());
+    Ok((project, clip))
+}
+
+fn validate_loaded_project(project: &mut Project, clip: Option<&Clip>) {
+    project.studio.validate_media(clip);
+    project.studio.validate_source_analysis(clip);
     project.studio.validate_song();
     NamedSample::validate_sources(&mut project.samples, |index| {
-        clip.as_ref()?.source(index).map(Clip::duration)
+        clip?.source(index).map(Clip::duration)
     });
-    Ok((project, clip))
 }
 
 fn validate_snapshot_sources(project: &Project, count: usize) -> Result<()> {
@@ -920,17 +939,142 @@ fn library_path() -> Option<PathBuf> {
     Some(app_data_dir()?.join("crate.json"))
 }
 
-pub fn read_library() -> Library {
-    library_path()
-        .and_then(|path| File::open(path).ok())
-        .and_then(|file| serde_json::from_reader(BufReader::new(file)).ok())
-        .unwrap_or_default()
+pub struct LibraryRecovery {
+    pub message: String,
+    backup: Option<Vec<u8>>,
+}
+
+impl LibraryRecovery {
+    pub fn has_backup(&self) -> bool {
+        self.backup.is_some()
+    }
+
+    pub fn restore(&self) -> Result<Option<PathBuf>> {
+        let path = library_path().ok_or("No app data directory is available")?;
+        self.restore_at(&path)
+    }
+
+    fn restore_at(&self, path: &Path) -> Result<Option<PathBuf>> {
+        let backup = self.backup.as_deref().ok_or("No readable crate backup")?;
+        let _lock = lock_library(path)?;
+        if read_optional(&path.with_extension("json.bak"))?.as_deref() != Some(backup) {
+            return Err("The crate backup changed. Restart to load the current backup.".into());
+        }
+        let preserved = if let Some(bytes) = read_optional(path)? {
+            if serde_json::from_slice::<Library>(&bytes).is_ok() {
+                return Err("The crate is now readable. Restart to load it.".into());
+            }
+            let mut file = tempfile::Builder::new()
+                .prefix("crate.damaged-")
+                .suffix(".json")
+                .tempfile_in(path.parent().ok_or("No app data directory is available")?)?;
+            file.write_all(&bytes)?;
+            file.as_file().sync_all()?;
+            Some(file.into_temp_path().keep()?)
+        } else {
+            None
+        };
+        write_atomically(path, |file| Ok(file.write_all(backup)?))?;
+        Ok(preserved)
+    }
+}
+
+fn read_optional(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn lock_library(path: &Path) -> Result<File> {
+    let lock = File::options()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("lock"))?;
+    lock.try_lock()?;
+    Ok(lock)
+}
+
+fn load_library_file(path: &Path) -> Result<Option<(Library, Vec<u8>)>> {
+    read_optional(path)?
+        .map(|bytes| Ok((serde_json::from_slice(&bytes)?, bytes)))
+        .transpose()
+}
+
+pub fn read_library() -> (Library, Option<LibraryRecovery>) {
+    match library_path() {
+        Some(path) => read_library_at(&path),
+        None => (
+            Library::default(),
+            Some(LibraryRecovery {
+                message: "No app data directory is available. Crate changes are session-only.".into(),
+                backup: None,
+            }),
+        ),
+    }
+}
+
+fn read_library_at(path: &Path) -> (Library, Option<LibraryRecovery>) {
+    let primary = match load_library_file(path) {
+        Ok(Some((library, _))) => return (library, None),
+        other => other,
+    };
+    let backup_path = path.with_extension("json.bak");
+    let backup = load_library_file(&backup_path);
+    if matches!((&primary, &backup), (Ok(None), Ok(None))) {
+        return (Library::default(), None);
+    }
+
+    let problem = match primary {
+        Err(error) => format!("Could not load {} ({error}).", path.display()),
+        Ok(_) => format!("{} is missing.", path.display()),
+    };
+    let (library, backup, detail) = match backup {
+        Ok(Some((library, bytes))) => {
+            (library, Some(bytes), "Using the last good backup.".into())
+        }
+        Ok(None) => (
+            Library::default(),
+            None,
+            format!("Backup missing at {}.", backup_path.display()),
+        ),
+        Err(error) => (
+            Library::default(),
+            None,
+            format!("Could not load {} ({error}).", backup_path.display()),
+        ),
+    };
+    (
+        library,
+        Some(LibraryRecovery {
+            message: format!("{problem} {detail} Crate changes are session-only until recovery."),
+            backup,
+        }),
+    )
 }
 
 pub fn write_library(library: &Library) -> Result<()> {
     let path = library_path().ok_or("No app data directory is available")?;
-    std::fs::create_dir_all(path.parent().expect("app data directory"))?;
-    export_json(&path, library)
+    write_library_at(&path, library)
+}
+
+fn write_library_at(path: &Path, library: &Library) -> Result<()> {
+    if let Some(directory) = path.parent() {
+        std::fs::create_dir_all(directory)?;
+    }
+    let _lock = lock_library(path)?;
+    let backup = path.with_extension("json.bak");
+    let previous = load_library_file(path)
+        .map_err(|error| format!("The crate could not be read. Restart to recover it ({error})."))?;
+    if previous.is_none() && read_optional(&backup)?.is_some() {
+        return Err("The crate is missing and a backup exists. Restart to recover it.".into());
+    }
+    let bytes = serde_json::to_vec_pretty(library)?;
+    let last_good = previous.as_ref().map_or(bytes.as_slice(), |(_, raw)| raw);
+    write_atomically(&backup, |file| Ok(file.write_all(last_good)?))?;
+    write_atomically(path, |file| Ok(file.write_all(&bytes)?))
 }
 
 pub fn export_json(path: &Path, library: &Library) -> Result<()> {
@@ -953,7 +1097,7 @@ pub fn export_csv(path: &Path, library: &Library) -> Result<()> {
                 Source::File(path) => path.display().to_string(),
                 Source::YouTube { id } => crate::youtube::watch_url(id).unwrap_or_default(),
                 Source::Commons { page, .. } => page.clone(),
-                Source::Generated(_) => "Embedded project audio".into(),
+                Source::Generated(_) | Source::Extracted(_) => "Embedded project audio".into(),
             };
             writeln!(
                 file,
@@ -981,6 +1125,76 @@ pub fn export_csv(path: &Path, library: &Library) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn damaged_crate_preserves_its_bytes_and_restores_the_previous_good_save() -> Result<()> {
+        let folder = tempfile::tempdir()?;
+        let path = folder.path().join("crate.json");
+        assert!(read_library_at(&path).1.is_none());
+
+        let mut library = Library {
+            heard: 12,
+            ..Library::default()
+        };
+        write_library_at(&path, &library)?;
+        let first = std::fs::read(&path)?;
+        assert_eq!(std::fs::read(path.with_extension("json.bak"))?, first);
+        library.heard = 34;
+        write_library_at(&path, &library)?;
+        assert_eq!(read_library_at(&path).0.heard, 34);
+
+        let damaged = b"{ damaged crate \xff";
+        std::fs::write(&path, damaged)?;
+        let (library, recovery) = read_library_at(&path);
+        let recovery = recovery.expect("damaged crate should require recovery");
+        assert_eq!(library.heard, 12);
+        assert!(recovery.has_backup());
+        assert!(write_library_at(&path, &Library::default()).is_err());
+        assert_eq!(std::fs::read(&path)?, damaged);
+
+        let preserved = recovery.restore_at(&path)?.expect("damaged crate copy");
+        assert_eq!(std::fs::read(preserved)?, damaged);
+        assert_eq!(std::fs::read(&path)?, first);
+        assert!(read_library_at(&path).1.is_none());
+        assert!(recovery.restore_at(&path).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn missing_crate_requires_recovery_if_a_backup_exists() -> Result<()> {
+        let folder = tempfile::tempdir()?;
+        let path = folder.path().join("crate.json");
+        let backup = path.with_extension("json.bak");
+        std::fs::write(&backup, b"invalid backup")?;
+        let (_, recovery) = read_library_at(&path);
+        assert!(!recovery.expect("backup exists").has_backup());
+        assert!(write_library_at(&path, &Library::default()).is_err());
+        assert_eq!(std::fs::read(&backup)?, b"invalid backup");
+
+        let library = Library {
+            heard: 7,
+            ..Library::default()
+        };
+        export_json(&backup, &library)?;
+        let (library, recovery) = read_library_at(&path);
+        assert_eq!(library.heard, 7);
+        assert!(recovery.expect("backup exists").restore_at(&path)?.is_none());
+        assert_eq!(read_library_at(&path).0.heard, 7);
+        Ok(())
+    }
+
+    #[test]
+    fn crate_read_error_does_not_allow_saving_over_the_path() -> Result<()> {
+        let folder = tempfile::tempdir()?;
+        let path = folder.path().join("crate.json");
+        std::fs::create_dir(&path)?;
+        let (_, recovery) = read_library_at(&path);
+        assert!(!recovery.expect("crate read failed").has_backup());
+        assert!(write_library_at(&path, &Library::default()).is_err());
+        assert!(path.is_dir());
+        assert!(!path.with_extension("json.bak").exists());
+        Ok(())
+    }
 
     #[test]
     fn cancelled_export_preserves_existing_destination_and_retry_can_replace_it() -> Result<()> {

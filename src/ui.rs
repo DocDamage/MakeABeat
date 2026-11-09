@@ -3,9 +3,9 @@ use crate::{
     audio::{Command, PadMode},
     midi::{Route, Target},
     model::{
-        ChopInput, DRUMS, GENRES, KITS, KeyChop, MAX_BARS, MAX_NAMED_SAMPLES, MAX_SAMPLE_NAME,
+        DRUMS, GENRES, KeyChop, MAX_NAMED_SAMPLES, MAX_SAMPLE_NAME,
         MIN_LOOP_SECONDS, PAD_LABELS, PIANO_HIGH, PIANO_LOW, Quantize, ReleaseInfo, STEPS,
-        SampleControls, Source, Studio, TICKS_PER_BAR, TICKS_PER_STEP, Verdict, drum_velocity, encode_drum_velocity, piano_note,
+        SampleControls, Source, Studio, Verdict, piano_note,
     },
     waveform::{Snap, WaveformView, transient_near},
 };
@@ -20,6 +20,7 @@ pub(crate) mod drum_templates;
 pub(crate) mod variation;
 pub(crate) mod snapshots;
 mod beat_map;
+mod extraction;
 mod groove;
 mod search;
 mod transcription;
@@ -27,6 +28,7 @@ mod layers;
 pub(crate) mod export;
 pub(crate) mod piano_roll;
 pub(crate) mod preferences;
+pub(crate) mod sequencer;
 mod step_grid;
 
 const BG: Color32 = Color32::from_rgb(13, 12, 11);
@@ -195,6 +197,9 @@ fn panel() -> Frame {
 }
 
 pub fn draw(app: &mut App, ctx: &Context) {
+    if app.page != Page::Studio || app.studio_view != StudioView::Sequence {
+        app.sequence_tool = None;
+    }
     let had_import_dialog = app.youtube_url.is_some();
     egui::TopBottomPanel::top("navigation")
         .frame(Frame::new().fill(PANEL).inner_margin(Margin::symmetric(14, 8)))
@@ -211,7 +216,13 @@ pub fn draw(app: &mut App, ctx: &Context) {
                 studio_header(app, ui);
             }
         });
-    if app.busy.is_some() || app.status.is_some() || app.audio_error.is_some() || app.analysis_job().is_some() {
+    if app.busy.is_some()
+        || app.status.is_some()
+        || app.audio_error.is_some()
+        || app.analysis_job().is_some()
+        || app.library_recovery.is_some()
+        || app.crate_save_error().is_some()
+    {
         egui::TopBottomPanel::bottom("status")
             .frame(Frame::new().fill(PANEL).inner_margin(Margin::symmetric(14, 6)))
             .show(ctx, |ui| notice(app, ui));
@@ -279,6 +290,8 @@ pub fn draw(app: &mut App, ctx: &Context) {
         && !roll.show(app, ctx)
     {
         app.piano_roll = Some(roll);
+    } else if app.page == Page::Studio && app.studio_view == StudioView::Sequence {
+        sequencer::dialog(app, ctx);
     }
 }
 
@@ -852,6 +865,34 @@ pub(crate) fn job_controls(app: &App, ui: &mut Ui) {
 }
 
 fn notice(app: &mut App, ui: &mut Ui) {
+    if let Some(recovery) = &app.library_recovery {
+        let restore = ui
+            .horizontal_wrapped(|ui| {
+                ui.label(label(&recovery.message, 13.0, GOLD));
+                recovery.has_backup()
+                    && ui.add_enabled(
+                        !app.restoring_library(),
+                        egui::Button::new(if app.restoring_library() {
+                            "Restoring crate…"
+                        } else {
+                            "Restore crate backup"
+                        }).small(),
+                    ).clicked()
+            })
+            .inner;
+        if restore {
+            app.restore_library();
+        }
+    }
+    if let Some(error) = app.crate_save_error() {
+        let retry = ui.horizontal_wrapped(|ui| {
+            ui.label(label(format!("Could not save crate. {error}"), 13.0, GOLD));
+            ui.small_button("Retry crate save").clicked()
+        }).inner;
+        if retry {
+            app.retry_crate_save();
+        }
+    }
     if let Some((job, state, queued)) = app.analysis_job() {
         ui.horizontal_wrapped(|ui| {
             if !app.library.interface.reduce_motion { ui.spinner(); }
@@ -1954,6 +1995,10 @@ fn studio_header(app: &mut App, ui: &mut Ui) {
 
 fn studio(app: &mut App, ui: &mut Ui) {
     let view = app.studio_view;
+    if view == StudioView::Sequence {
+        sequencer::show(app, ui);
+        return;
+    }
     if view == StudioView::Sample && app.library.interface.show_pads && ui.available_width() >= 980.0 {
         let width = app.library.interface.pads_width.clamp(330.0, ui.available_width() * 0.56);
         let panel = egui::SidePanel::right("sample_performance")
@@ -1970,11 +2015,10 @@ fn studio(app: &mut App, ui: &mut Ui) {
         }
     }
     ScrollArea::vertical()
-        .drag_to_scroll(view != StudioView::Sequence)
         .id_salt(match view {
             StudioView::Sample => "sample",
             StudioView::Perform => "perform",
-            StudioView::Sequence => "sequence",
+            StudioView::Sequence => unreachable!(),
             StudioView::Arrange => "arrangement",
             StudioView::Mix => "mix",
         })
@@ -1982,7 +2026,7 @@ fn studio(app: &mut App, ui: &mut Ui) {
         .show(ui, |ui| match view {
             StudioView::Sample => sample_panel(app, ui),
             StudioView::Perform => performance_panel(app, ui),
-            StudioView::Sequence => sequencer(app, ui),
+            StudioView::Sequence => unreachable!(),
             StudioView::Arrange => arrangement::show(app, ui),
             StudioView::Mix => mixer_panel(app, ui),
         });
@@ -2047,6 +2091,7 @@ fn sample_panel(app: &mut App, ui: &mut Ui) {
     groove::panel(app, ui, true);
     warp_editor(app, ui);
     if app.clip.is_some() {
+        extraction::panel(app, ui);
         ui.collapsing("Stem separation", |ui| {
             small(ui, "Demucs processes the selection locally and adds vocals, drums, bass, and other as separate sources. Its first run may download model weights.");
             ui.horizontal_wrapped(|ui| {
@@ -3865,216 +3910,6 @@ fn project_history(app: &mut App, ui: &mut Ui) {
     }
 }
 
-fn sequencer(app: &mut App, ui: &mut Ui) {
-    panel().show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal_wrapped(|ui| {
-            let name = app.studio.editing_pattern.map_or("Working pattern", |index| app.studio.patterns[index].name.as_str());
-            ui.label(label(name, 14.0, MINT).strong());
-            if action(ui, "Arrange song…", !app.recording).clicked() {
-                app.open_arrangement();
-            }
-            if !app.studio.sections.is_empty() {
-                small(ui, format!("{} sections · {} bars", app.studio.sections.len(), app.studio.song_bars()));
-            }
-        });
-        ui.horizontal_wrapped(|ui| {
-            let can_record = app.recording || (app.output.is_some() && app.clip.is_some());
-            if action(ui, if app.recording { "● Finish recording" } else { "● Record" }, can_record)
-                .on_hover_text("Overdub the pads or piano with the mouse, computer keyboard, or MIDI")
-                .clicked()
-            {
-                app.toggle_recording();
-            }
-            small(ui, "Quantize");
-            ui.add_enabled_ui(!app.recording, |ui| {
-                ComboBox::from_id_salt("record_quantize").selected_text(app.quantize.label()).width(55.0)
-                    .show_ui(ui, |ui| {
-                        for quantize in Quantize::ALL {
-                            ui.selectable_value(&mut app.quantize, quantize, quantize.label());
-                        }
-                    });
-            }).response.on_hover_text("Off keeps your timing. Grid settings snap new hits to the nearest division.");
-            if ui.checkbox(&mut app.click_track, "Click").on_hover_text("Play a metronome during playback and recording").changed() {
-                app.send(Command::ClickTrack(app.click_track));
-            }
-            if app.recording {
-                let status = if app.playing { "Recording" } else { "Armed · waiting for MIDI Start" };
-                ui.label(label(status, 12.0, GOLD).strong());
-            }
-            if action(ui, "Piano roll…", !app.recording && (app.clip.is_some() || !app.studio.performance.is_empty()))
-                .on_hover_text("Draw or edit pad and piano hits")
-                .clicked()
-            {
-                app.piano_roll = Some(piano_roll::PianoRoll::new(app));
-            }
-        });
-        let compact = ui.available_width() < 660.0;
-        ui.horizontal_wrapped(|ui| {
-            small(ui, "BPM");
-            let tempo = ui.add(DragValue::new(&mut app.studio.bpm).range(40..=240).speed(0.25));
-            named_number(tempo, "Tempo in beats per minute", f64::from(app.studio.bpm));
-            if action(ui, "Tap", true).clicked() { app.tap(); }
-            if action(ui, "Estimate BPM", app.duration() >= 6.0 && app.busy.is_none())
-                .on_hover_text("Estimate 60–180 BPM from the selection if it lasts at least six seconds, or from the whole source")
-                .clicked()
-            {
-                app.estimate_tempo();
-            }
-            small(ui, "BARS");
-            ui.add_enabled_ui(!app.recording, |ui| {
-                ComboBox::from_id_salt("bars").selected_text(app.studio.bars.to_string()).width(48.0)
-                    .show_ui(ui, |ui| {
-                        for count in 1..=MAX_BARS { ui.selectable_value(&mut app.studio.bars, count, count.to_string()); }
-                    });
-            });
-            if compact { ui.end_row(); }
-            small(ui, "KIT");
-            ComboBox::from_id_salt("kit").selected_text(KITS[app.studio.kit]).width(72.0)
-                .show_ui(ui, |ui| {
-                    for (index, name) in KITS.into_iter().enumerate() { ui.selectable_value(&mut app.studio.kit, index, name); }
-                });
-            app.bar = app.bar.min(app.studio.bars - 1);
-            if action(ui, "Drum templates…", !app.recording).clicked() {
-                app.drum_templates = Some(drum_templates::Browser::default());
-            }
-            if action(ui, "Export MIDI", (app.studio.has_pattern() || !app.studio.sections.is_empty()) && app.busy.is_none()).clicked() { app.export("mid"); }
-        });
-        if let Some(estimate) = app.tempo_estimate {
-            ui.horizontal_wrapped(|ui| {
-                small(ui, format!("Estimated {} BPM · onset match {}%", estimate.bpm, estimate.strength));
-                for candidate in [estimate.bpm / 2, estimate.bpm, estimate.bpm * 2] {
-                    if !(40..=240).contains(&candidate) { continue; }
-                    ui.menu_button(format!("{candidate} BPM"), |ui| {
-                        if action(ui, "Audition beat grid", app.output.is_some() && !app.playing).clicked() {
-                            app.audition_tempo(candidate);
-                            ui.close_menu();
-                        }
-                        if action(ui, "Apply tempo", true).clicked() {
-                            app.studio.bpm = candidate;
-                            app.tempo_estimate = None;
-                            app.send(Command::StopListening);
-                            ui.close_menu();
-                        }
-                    });
-                }
-                if action(ui, "Dismiss", true).clicked() {
-                    app.tempo_estimate = None;
-                }
-            });
-        }
-        if app.studio.bars > 1 {
-            ui.horizontal_wrapped(|ui| {
-                for bar in 0..app.studio.bars {
-                    let playing = app.song_playing.is_none() && app.step.is_some_and(|step| step / STEPS == bar);
-                    let title = if playing { format!("▶ {}", bar + 1) } else { format!("{}", bar + 1) };
-                    if pill(ui, &title, app.bar == bar).clicked() { app.bar = bar; }
-                }
-            });
-        }
-        ui.collapsing("Recording options", |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.add_enabled_ui(!app.recording, |ui| {
-                    ui.checkbox(&mut app.replace_take, "Replace recorded notes");
-                    ui.add(DragValue::new(&mut app.count_in_bars).range(0..=2).prefix("Count-in ").suffix(" bars"))
-                        .on_hover_text("Applies when starting stopped playback on the internal clock.");
-                    ui.checkbox(&mut app.punch_in, "Punch in");
-                    if app.punch_in {
-                        ui.add(DragValue::new(&mut app.punch_first).range(1..=app.studio.bars).prefix("From bar "));
-                        ui.add(DragValue::new(&mut app.punch_last).range(app.punch_first.min(app.studio.bars)..=app.studio.bars).prefix("Through bar "));
-                    }
-                });
-                let mut gain = (app.click_gain * 100.0).round() as u8;
-                if ui.add(DragValue::new(&mut gain).range(0..=100).prefix("Click ").suffix("%")).changed() {
-                    app.click_gain = f32::from(gain) * 0.01;
-                    app.send(Command::ClickGain(app.click_gain));
-                }
-            });
-        });
-        bar_actions(app, ui);
-        ui.horizontal_wrapped(|ui| {
-            let free_pad = app.studio.pads.iter().any(Option::is_none);
-            let has_sound = app.studio.has_pattern() || app.studio.active_loop().is_some();
-            if action(ui, "Resample pattern to pad", app.can_add_source() && !app.recording && free_pad && has_sound)
-                .on_hover_text("Render one pass of the current pattern and assign it to an empty pad")
-                .on_disabled_hover_text("A playable pattern, an empty pad, and available source space are required")
-                .clicked()
-            {
-                app.resample_mix(false);
-            }
-            ComboBox::from_id_salt("sequence_pad")
-                .selected_text(format!("Pad {:02}", app.selected_pad + 1))
-                .show_ui(ui, |ui| {
-                    for pad in 0..STEPS {
-                        if app.studio.pads[pad].is_some() {
-                            ui.selectable_value(&mut app.selected_pad, pad, format!("Pad {:02}", pad + 1));
-                        }
-                    }
-                }).response.on_hover_text("Choose the pad to place on the Chops row");
-            ComboBox::from_id_salt("sequence_key")
-                .selected_text(piano_note(app.piano_key))
-                .show_ui(ui, |ui| {
-                    for note in PIANO_LOW..=PIANO_HIGH {
-                        if app.key_range(note).is_some() {
-                            ui.selectable_value(&mut app.piano_key, note, piano_note(note));
-                        }
-                    }
-                }).response.on_hover_text("Choose the key to place on the Keys row");
-        });
-        grid(app, ui);
-        groove::panel(app, ui, false);
-        ui.horizontal_wrapped(|ui| {
-            if action(ui, "Clear pad steps", app.studio.chops[app.bar].iter().any(Option::is_some)).clicked() {
-                app.studio.chops[app.bar] = [None; STEPS];
-            }
-            if app.studio.key_steps[app.bar].iter().any(Option::is_some)
-                && action(ui, "Clear key steps", true).clicked()
-            {
-                app.studio.key_steps[app.bar] = [None; STEPS];
-            }
-            project_history(app, ui);
-            if action(ui, "Clear drums", app.studio.hits[app.bar].iter().flatten().any(|&hit| hit > 0)).clicked() {
-                app.studio.hits[app.bar] = [[0; STEPS]; DRUMS.len()];
-            }
-            let selected = if app.library.midi.piano_view { piano_note(app.piano_key) } else { format!("pad {}", app.selected_pad + 1) };
-            small(ui, format!("Editing bar {} / {}  ·  Selected {selected}", app.bar + 1, app.studio.bars));
-        });
-        small(ui, "Gold dots mark recorded hits. Drag across drum steps to paint or erase. Shift paints accents. Ctrl-click selects a step for velocity editing.");
-    });
-}
-
-fn bar_actions(app: &mut App, ui: &mut Ui) {
-    let bar = app.bar;
-    ui.add_enabled_ui(!app.recording && app.song_playing.is_none(), |ui| {
-        ui.horizontal_wrapped(|ui| {
-            if action(ui, "Copy bar", true).clicked() {
-                app.bar_clipboard = Some(app.studio.copy_bar(bar));
-            }
-            if action(ui, "Paste bar", app.bar_clipboard.is_some())
-                .on_hover_text("Replace the notes in the selected bar").clicked()
-                && let Some(content) = &app.bar_clipboard
-            {
-                app.studio.paste_bar(bar, content);
-            }
-            let space = app.studio.bars < MAX_BARS;
-            if action(ui, "Duplicate bar", space).clicked() {
-                let content = app.studio.copy_bar(bar);
-                app.studio.insert_bar(bar + 1);
-                app.studio.paste_bar(bar + 1, &content);
-                app.bar += 1;
-            }
-            if action(ui, "Insert bar", space).on_hover_text("Insert a blank bar after this one").clicked() {
-                app.studio.insert_bar(bar + 1);
-                app.bar += 1;
-            }
-            if action(ui, "Remove bar", app.studio.bars > 1).clicked() {
-                app.studio.remove_bar(bar);
-                app.bar = bar.min(app.studio.bars - 1);
-            }
-        });
-    });
-}
-
 fn mixer_panel(app: &mut App, ui: &mut Ui) {
     panel().show(ui, |ui| {
         ui.horizontal_top(|ui| {
@@ -4218,363 +4053,6 @@ fn audio_output_controls(app: &mut App, ui: &mut Ui) {
         }
     });
     ui.data_mut(|data| data.insert_temp(draft_id, draft));
-}
-
-fn grid(app: &mut App, ui: &mut Ui) {
-    use crate::model::grid_edit::{Cell, LANES, lane_name};
-    let selection_id = ui.id().with("grid_selection");
-    let mut selection = ui.data(|data| data.get_temp::<step_grid::Selection>(selection_id)).unwrap_or_default();
-    let can_select = !app.recording && app.song_playing.is_none();
-    selection.controls(ui, &mut app.studio, app.bar, can_select);
-    if action(ui, "Generate variations…", can_select).clicked() {
-        let selected = selection.enabled().then(|| selection.region()).flatten()
-            .map(|region| (app.bar, region));
-        app.variations = Some(variation::Dialog::new(app.studio.active_sequence(), selected));
-    }
-    let selecting = selection.enabled() && can_select;
-    let name_width = 77.0;
-    let gap = 4.0;
-    let step_width = ((ui.available_width() - name_width - gap * STEPS as f32) / STEPS as f32).max(20.0);
-    let bar = app.bar;
-    let cursor = app.step.filter(|_| app.song_playing.is_none());
-    let rule_id = ui.id().with("step_condition");
-    let mut rule_cell = ui.data(|data| data.get_temp::<(usize, usize)>(rule_id)).unwrap_or((2, 0));
-    let velocity_id = ui.id().with("drum_velocity");
-    let mut velocity_cell = ui.data(|data| data.get_temp::<(usize, usize)>(velocity_id));
-    let gesture_id = ui.id().with("drum_paint");
-    let mut gesture = ui.data(|data| data.get_temp::<u8>(gesture_id));
-    let (pressed, down, modifiers) = ui.input(|input| (
-        input.pointer.primary_pressed(),
-        input.pointer.primary_down(),
-        input.modifiers,
-    ));
-    if pressed || !down || selecting {
-        gesture = None;
-    }
-    let (press_at, pointer_at) = ui.input(|input| {
-        let press = input.events.iter().rev().find_map(|event| match event {
-            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, .. } => Some(*pos),
-            _ => None,
-        });
-        (press, input.pointer.interact_pos())
-    });
-    // Raw press positions can arrive before a widget gets a click response.
-    // Keep them on the grid's input layer so modal backdrops still block edits.
-    let layer = ui.layer_id();
-    let allows_pointer = app.drum_templates.is_none() && app.variations.is_none() && app.snapshot_dialog.is_none()
-        && ui.memory(|memory| memory.allows_interaction(layer));
-    let on_grid_layer = |&position: &Pos2| allows_pointer && ui.ctx().layer_id_at(position) == Some(layer);
-    let press_at = press_at.filter(on_grid_layer);
-    let pointer_at = pointer_at.filter(on_grid_layer);
-    let mut selection_start = None;
-    let mut selection_end = None;
-    let mut recorded = [[0; STEPS]; 2];
-    for event in &app.studio.performance {
-        if event.tick / TICKS_PER_BAR == bar as u32 && app.studio.performance_is_playable(event) {
-            let row = usize::from(matches!(event.input, ChopInput::Key(_)));
-            let step = (event.tick % TICKS_PER_BAR / TICKS_PER_STEP) as usize;
-            recorded[row][step] += 1;
-        }
-    }
-    ScrollArea::horizontal().id_salt("step_grid_lanes").drag_to_scroll(false).show(ui, |ui| {
-        ui.spacing_mut().item_spacing = vec2(gap, gap);
-        ui.horizontal(|ui| {
-            ui.allocate_space(vec2(name_width, 14.0));
-            for step in 0..STEPS {
-                let text = if step % 4 == 0 {
-                    format!("{}", step / 4 + 1)
-                } else {
-                    "·".into()
-                };
-                ui.add_sized(
-                    [step_width, 14.0],
-                    Label::new(label(text, 10.0, FAINT).monospace()),
-                );
-            }
-        });
-        for row in 0..LANES {
-            let name = lane_name(row);
-            ui.horizontal(|ui| {
-                if row < 2 {
-                    ui.add_sized(
-                        [name_width, 24.0],
-                        Label::new(label(name, 12.0, if row == 0 { BLUE } else { MINT }).strong()),
-                    );
-                } else if ui
-                    .add_sized(
-                        [name_width, 24.0],
-                        Button::new(label(name, 12.0, TEXT)).frame(false),
-                    )
-                    .clicked()
-                {
-                    app.send(Command::Drum(row - 2));
-                }
-                for step in 0..STEPS {
-                    let count = recorded.get(row).map_or(0, |counts| counts[step]);
-                    let (fill, text) = if row == 0 {
-                        let pad = app.studio.chops[bar][step];
-                        (
-                            pad.map(|_| Color32::from_rgb(34, 84, 115)),
-                            pad.map_or(String::new(), |pad| (pad + 1).to_string()),
-                        )
-                    } else if row == 1 {
-                        let note = app.studio.key_steps[bar][step];
-                        (
-                            note.map(|_| Color32::from_rgb(26, 87, 68)),
-                            note.map_or_else(String::new, piano_note),
-                        )
-                    } else {
-                        let velocity = drum_velocity(app.studio.hits[bar][row - 2][step]);
-                        let fill = (velocity > 0).then(|| {
-                            let intensity = f32::from(velocity) / 127.0;
-                            Color32::from_rgb(
-                                (55.0 + intensity * 130.0) as u8,
-                                (36.0 + intensity * 117.0) as u8,
-                                (84.0 + intensity * 168.0) as u8,
-                            )
-                        });
-                        (fill, String::new())
-                    };
-                    let active = cursor == Some(bar * STEPS + step);
-                    let empty = if step / 4 % 2 == 0 {
-                        INSET
-                    } else {
-                        Color32::from_rgb(20, 18, 17)
-                    };
-                    let sense = if selecting { Sense::click_and_drag() } else { Sense::click() };
-                    let (rect, response) = ui.allocate_exact_size(vec2(step_width, 25.0), sense);
-                    let cell = Cell { lane: row, step };
-                    if selecting {
-                        let visible = rect.intersect(ui.clip_rect());
-                        if press_at.is_some_and(|pos| visible.contains(pos)) {
-                            selection_start = Some(cell);
-                        }
-                        if pointer_at.is_some_and(|pos| visible.contains(pos)) {
-                            selection_end = Some(cell);
-                        }
-                    }
-                    let marked = selecting && selection.region().is_some_and(|region| region.contains(cell));
-                    let p = ui.painter_at(rect);
-                    let color = fill.unwrap_or(if response.hovered() { EDGE } else { empty });
-                    let stroke = if marked {
-                        Stroke::new(2.0_f32, BLUE)
-                    } else if response.has_focus() || active {
-                        Stroke::new(1.2_f32, MINT)
-                    } else if row >= 2 && velocity_cell == Some((row - 2, step)) {
-                        Stroke::new(1.2_f32, GOLD)
-                    } else {
-                        Stroke::NONE
-                    };
-                    p.rect(rect, 4.0, color, stroke, StrokeKind::Inside);
-                    if count > 0 {
-                        p.circle_filled(rect.right_top() + vec2(-4.5, 4.5), 2.6, GOLD);
-                    }
-                    if !text.is_empty() {
-                        p.text(
-                            rect.center(),
-                            Align2::CENTER_CENTER,
-                            text,
-                            FontId::monospace(11.0),
-                            TEXT,
-                        );
-                    }
-                    if app.studio.step_rules[bar].contains_key(&((row * STEPS + step) as u8)) {
-                        p.circle_stroke(rect.left_top() + vec2(5.0, 5.0), 2.5, Stroke::new(1.0_f32, BLUE));
-                    }
-                    let mut description = format!("{name} · bar {} · step {}", bar + 1, step + 1);
-                    if count > 0 {
-                        description.push_str(&format!(" · {count} recorded"));
-                    }
-                    if row >= 2 {
-                        let velocity = drum_velocity(app.studio.hits[bar][row - 2][step]);
-                        description.push_str(&format!(" · velocity {velocity}"));
-                    } else if let Some(assignment) = match row {
-                        0 => app.studio.chops[bar][step].map(|pad| format!("Pad {}", pad + 1)),
-                        _ => app.studio.key_steps[bar][step].map(piano_note),
-                    } {
-                        description.push_str(&format!(" · {assignment}"));
-                    } else {
-                        description.push_str(" · Empty");
-                    }
-                    response.widget_info(|| WidgetInfo::selected(WidgetType::Button, true, marked, &description));
-                    response.clone().on_hover_text(description);
-                    if selecting {
-                        continue;
-                    }
-                    if response.clicked() && modifiers.alt {
-                        rule_cell = (row, step);
-                        continue;
-                    }
-                    let shift = ui.input(|input| input.modifiers.shift);
-                    if row < 2 && response.secondary_clicked() {
-                        let start = bar as u32 * TICKS_PER_BAR + step as u32 * TICKS_PER_STEP;
-                        app.studio.performance.retain(|event| {
-                            !(start..start + TICKS_PER_STEP).contains(&event.tick)
-                                || usize::from(matches!(event.input, ChopInput::Key(_))) != row
-                        });
-                    }
-                    if row == 0 {
-                        let slot = &mut app.studio.chops[bar][step];
-                        if response.secondary_clicked()
-                            || (response.clicked() && *slot == Some(app.selected_pad))
-                        {
-                            *slot = None;
-                        } else if response.clicked() && app.studio.pads[app.selected_pad].is_some()
-                        {
-                            *slot = Some(app.selected_pad);
-                        }
-                    } else if row == 1 {
-                        let selected = app.piano_key;
-                        let assigned = app.key_range(selected).is_some();
-                        let slot = &mut app.studio.key_steps[bar][step];
-                        if response.secondary_clicked()
-                            || (response.clicked() && *slot == Some(selected))
-                        {
-                            *slot = None;
-                        } else if response.clicked() && assigned {
-                            *slot = Some(selected);
-                        }
-                    } else {
-                        let slot = &mut app.studio.hits[bar][row - 2][step];
-                        let inside = response.contains_pointer() && response.enabled();
-                        let began_here = response.enabled() && press_at.is_some_and(|pos| {
-                            rect.intersect(ui.clip_rect()).contains(pos)
-                        });
-                        if began_here {
-                            velocity_cell = Some((row - 2, step));
-                            if !modifiers.command && !modifiers.alt {
-                                let velocity = if shift { 127 } else { 89 };
-                                gesture = Some(if drum_velocity(*slot) == velocity { 0 } else { velocity });
-                            }
-                        }
-                        if (began_here || (down && inside)) && let Some(velocity) = gesture {
-                            *slot = encode_drum_velocity(velocity);
-                        }
-                        if response.clicked() && !response.clicked_by(egui::PointerButton::Primary) {
-                            velocity_cell = Some((row - 2, step));
-                            *slot = encode_drum_velocity(if *slot == 0 { 89 } else { 0 });
-                        }
-                        if response.secondary_clicked() {
-                            *slot = 0;
-                            velocity_cell = Some((row - 2, step));
-                        }
-                    }
-
-                }
-            });
-        }
-    });
-    if selecting {
-        let previous = selection.region();
-        selection.pointer(selection_start, selection_end, down);
-        if selection.region() != previous {
-            ui.ctx().request_repaint();
-        }
-    }
-    ui.data_mut(|data| data.insert_temp(selection_id, selection));
-    ui.collapsing("Lane timing", |ui| {
-        let selected_id = ui.id().with("timing_lane");
-        let mut lane = ui.data(|data| data.get_temp::<usize>(selected_id)).unwrap_or(2);
-        ui.add_enabled_ui(!app.playing, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ComboBox::from_id_salt("timing_lane").selected_text(lane_name(lane)).show_ui(ui, |ui| {
-                    for row in 0..LANES {
-                        let offset = app.studio.lane_offsets[row];
-                        ui.selectable_value(&mut lane, row, format!("{} · {offset:+} ticks", lane_name(row)));
-                    }
-                });
-                let offset = &mut app.studio.lane_offsets[lane];
-                let limit = crate::model::MAX_LANE_OFFSET;
-                let timing = ui.add(DragValue::new(offset).range(-limit..=limit).prefix("Timing ").suffix(" ticks"));
-                named_number(timing, "Lane timing offset in ticks", f64::from(*offset));
-                let milliseconds = f64::from(*offset) * 60_000.0 / (f64::from(app.studio.bpm) * 480.0);
-                small(ui, format!("{milliseconds:+.1} ms"));
-                if action(ui, "Reset lane", *offset != 0).clicked() {
-                    *offset = 0;
-                }
-                if action(ui, "Reset all lanes", app.studio.lane_offsets.iter().any(|&offset| offset != 0)).clicked() {
-                    app.studio.lane_offsets.fill(0);
-                }
-            });
-        });
-        ui.data_mut(|data| data.insert_temp(selected_id, lane));
-        small(ui, "Negative values play early. Timing stays within each bar and applies to programmed steps, including repeats. Recorded notes keep their original timing.");
-        if app.playing { small(ui, "Stop playback to edit lane timing."); }
-    });
-    ui.collapsing("Step conditions", |ui| {
-        ui.horizontal_wrapped(|ui| {
-            let lanes = ["Chops", "Keys"].into_iter().chain(DRUMS);
-            ComboBox::from_id_salt("condition_lane").selected_text(lanes.clone().nth(rule_cell.0).unwrap_or("Chops"))
-                .show_ui(ui, |ui| {
-                    for (row, label) in lanes.enumerate() {
-                        ui.selectable_value(&mut rule_cell.0, row, label);
-                    }
-                });
-            let mut step = rule_cell.1 + 1;
-            ui.add(DragValue::new(&mut step).range(1..=STEPS).prefix("Step "));
-            rule_cell.1 = step - 1;
-            let key = (rule_cell.0 * STEPS + rule_cell.1) as u8;
-            let old = app.studio.step_rules[bar].get(&key).copied().unwrap_or_default();
-            let mut rule = old;
-            ui.add(DragValue::new(&mut rule.chance).range(0..=100).prefix("Chance ").suffix("%"));
-            ui.add(DragValue::new(&mut rule.repeats).range(1..=4).prefix("Hits "));
-            ui.add(DragValue::new(&mut rule.every).range(1..=16).prefix("Every ").suffix(" passes"));
-            ComboBox::from_id_salt("condition_fill").selected_text(rule.fill.label()).show_ui(ui, |ui| {
-                for condition in crate::model::FillCondition::ALL {
-                    ui.selectable_value(&mut rule.fill, condition, condition.label());
-                }
-            });
-            if action(ui, "Reset condition", old != crate::model::StepRule::default()).clicked() {
-                rule = Default::default();
-            }
-            if rule != old {
-                app.studio.set_step_rule(bar, rule_cell.0, rule_cell.1, rule);
-            }
-            if app.studio.step_has_hit(bar, rule_cell.0, rule_cell.1) {
-                let old = app.studio.step_feel[bar].get(&key).copied().unwrap_or_default();
-                let mut feel = old;
-                let max = crate::model::groove::MAX_OFFSET;
-                ui.add(DragValue::new(&mut feel.offset).range(-max..=max).prefix("Hit timing ").suffix(" ticks"));
-                if rule_cell.0 < 2 {
-                    let base = if rule_cell.0 == 0 { 127 } else { 112 };
-                    let mut velocity = feel.velocity.unwrap_or(base);
-                    if ui.add(DragValue::new(&mut velocity).range(1..=127).prefix("Hit velocity ")).changed() {
-                        feel.velocity = (velocity != base).then_some(velocity);
-                    }
-                }
-                if action(ui, "Reset hit feel", old != Default::default()).clicked() { feel = Default::default(); }
-                if feel != old {
-                    crate::model::groove::set_feel(&mut app.studio.step_feel[bar], key, feel);
-                }
-                let mut sound = app.studio.step_sounds[bar].get(&key).copied().unwrap_or_default();
-                if layers::hit_sound(ui, &mut sound) {
-                    app.studio.set_step_sound(bar, rule_cell.0, rule_cell.1, sound);
-                }
-            }
-        });
-        small(ui, "Alt-click a step to select it here. Exports render with Fill off.");
-    });
-    ui.data_mut(|data| data.insert_temp(rule_id, rule_cell));
-    ui.data_mut(|data| {
-        if let Some(cell) = velocity_cell {
-            data.insert_temp(velocity_id, cell);
-        }
-        if let Some(velocity) = gesture {
-            data.insert_temp(gesture_id, velocity);
-        } else {
-            data.remove::<u8>(gesture_id);
-        }
-    });
-    if let Some((row, step)) = velocity_cell {
-        ui.horizontal_wrapped(|ui| {
-            small(ui, format!("{} · Step {}", DRUMS[row], step + 1));
-            let slot = &mut app.studio.hits[bar][row][step];
-            let mut velocity = drum_velocity(*slot);
-            if ui.add(DragValue::new(&mut velocity).range(0..=127).prefix("Velocity ")).changed() {
-                *slot = encode_drum_velocity(velocity);
-            }
-        });
-    }
 }
 
 fn fx(ui: &mut Ui, name: &str, value: &mut f32) {
