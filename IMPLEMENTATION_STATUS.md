@@ -164,3 +164,20 @@ The 30-minute rerun completed 804 workload cycles and indexed 1,208 passages, sp
 The Windows playback and recording callbacks now apply CPAL's intended time-critical priority once on their dedicated stream thread, using the handle returned by `GetCurrentThread`. The WASAPI loopback harness uses the same helper and checks both thread priorities before collecting data. The 25-second CLAP preflight confirmed priority 15 on both threads and passed with 18 new passages and zero capture gaps. [Windows current thread handle](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getcurrentthread)
 
 The full 30-minute CLAP soak passed after the priority fix. It used the same AIR 192 6 endpoint at 44.1 kHz with 441-frame callbacks. The workload completed 806 cycles and indexed 1,212 passages, spending 115.37 s in the indexing stage. All 180,001 captured windows retained both test signals. Capture timestamp gaps fell from seven to zero, and extended intervals between render callbacks fell from 604 to 15. Peak callback time fell from 5.489 to 1.925 ms, with zero overruns in either CLAP run.
+
+### Windows release verification on 2026-11-09
+
+The 30-minute soak on commit `75ba98f` used Rust 1.99.1 on Windows 11 Pro (build 26200), the AIR 192 6 endpoint at 44.1 kHz, and 441-frame callbacks. Both stream threads reported Windows priority 15. The workload completed 799 render, analysis, save, and scan cycles and indexed 1,199 CLAP passages in 126.94 s of indexing.
+
+**The soak failed the loopback reference gate.** Of 180,001 loopback windows, 504 had a weak reference, 266 had a weak audition pilot, and 10 had both. The counters stopped increasing by the 15:30 checkpoint. The render probes recorded zero weak windows before WASAPI and zero callbacks over the 10 ms buffer budget, with a peak of 0.649 ms. Loopback capture reported zero timestamp gaps. The test recorded six extended intervals between render callbacks, with a longest interval of 20.323 ms. The cause and audibility of the loopback dips remain undetermined.
+
+The separate native UI probe used a temporary instrumented release build of the same commit and isolated application data. It exercised the Sequence grid during CLAP indexing of 530 distinct seven-second WAVs, persistence of a 1,000-record crate (67.8 MiB on disk), and recovery and portable saves of a project containing 90 seconds of stereo audio. A background timer queued pointer events for the native egui loop, with extra events triggered at the start of recovery writes. Latency ran from enqueue to the end of the app update that changed the drum step. It excludes physical input and display presentation.
+
+| Concurrent work | Completed jobs | Edits that overlapped the work | Max edit latency | Max gap between app updates |
+| --- | ---: | ---: | ---: | ---: |
+| CLAP indexing | 1 | 507 | 17.2 ms | 32.8 ms |
+| Crate persistence | 23 | 75 | 17.2 ms | 22.9 ms |
+| Recovery writes | 3 | 4 | 16.9 ms | 17.3 ms |
+| Portable project saves | 3 | 3 | 4.6 ms | 27.7 ms |
+
+All 590 edits changed the drum step, with a 13.6 ms p95 and a 17.2 ms maximum. Of the four edits that overlapped recovery writes, two reached project state before the write completed. Across 4,142 app updates, the longest update took 5.7 ms and the longest gap between update starts was 32.8 ms. Both stayed below the 100 ms target. The index finished with 530 passages and zero pending or failed files.
