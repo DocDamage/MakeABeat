@@ -496,6 +496,7 @@ mod tests {
         super::super::style(&ctx);
         let mut app = App::new(ctx.clone());
         app.output = None;
+        app.audio_error = None;
         app.library.interface = Default::default();
         app.library.interface.apply(&ctx);
         app.page = Page::Studio;

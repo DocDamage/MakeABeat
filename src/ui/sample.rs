@@ -635,6 +635,7 @@ mod tests {
         let ctx = Context::default();
         let mut app = App::new(ctx.clone());
         app.output = None;
+        app.audio_error = None;
         app.library.interface = Default::default();
         app.library.interface.apply(&ctx);
         app.record = Some(files::local_record(PathBuf::from("fixture.wav")));
