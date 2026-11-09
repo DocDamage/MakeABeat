@@ -96,11 +96,10 @@ pub fn generate(base: &Sequence, settings: &Settings) -> [Sequence; 4] {
             let movable: Vec<_> = (0..STEPS)
                 .filter(|&step| bar.pads[step].is_some() && !settings.locked(bar_index, 0, step))
                 .collect();
-            for pair in movable.chunks_exact(2) {
+            for &[a, b] in movable.as_chunks::<2>().0 {
                 if draw(&mut seed) >= settings.amount / 2 {
                     continue;
                 }
-                let (a, b) = (pair[0], pair[1]);
                 bar.pads.swap(a, b);
                 let first_feel = bar.feel.remove(&(a as u8));
                 let second_feel = bar.feel.remove(&(b as u8));

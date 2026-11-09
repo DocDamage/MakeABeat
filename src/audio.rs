@@ -909,7 +909,15 @@ fn output_stream<T: SizedSample + FromSample<f32>>(
                     status.callback_over_budget.fetch_add(1, Relaxed);
                 }
                 if let (Some(probe), Some(cycles)) = (probe, cycles) {
-                    diagnostic.callback(probe, started, frames, config_rate, commands_elapsed, mix_elapsed, elapsed_ns, cycles);
+                    diagnostic.callback(probe, soak::CallbackMeasurement {
+                        started,
+                        frames,
+                        rate: config_rate,
+                        commands_elapsed,
+                        mix_elapsed,
+                        elapsed_ns,
+                        cycles_start: cycles,
+                    });
                 }
             }
         },

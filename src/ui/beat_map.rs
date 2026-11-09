@@ -1,7 +1,7 @@
-use super::{BLUE, FAINT, GOLD, MINT, action, small};
+use super::{BLUE, FAINT, GOLD, MINT, action, command_button, small};
 use crate::{
     analysis_worker::{self, CHECKPOINT_BYTES},
-    app::App,
+    app::{App, actions::Action},
     model::beat_map::Beat,
 };
 use eframe::egui::{Color32, DragValue, Painter, Rect, Stroke, Ui};
@@ -9,198 +9,194 @@ use std::{ops::RangeInclusive, sync::Arc};
 
 pub(super) fn panel(app: &mut App, ui: &mut Ui) {
     if app.active_clip().is_none() {
+        small(ui, "Load a source to analyze or edit its beat map.");
+        model_setup(app, ui, app.analysis_job().is_none(), false);
         return;
     }
-    ui.collapsing("Beat map", |ui| {
-        let ready = app.analysis_job().is_none();
-        let duration = app.duration();
-        let range = app.selection().unwrap_or((0.0, duration));
-        let valid_range = (0.2..=analysis_worker::MAX_SECONDS).contains(&(range.1 - range.0));
-        ui.horizontal_wrapped(|ui| {
-            if action(ui, "Analyze with pulse estimator", ready && valid_range)
-                .on_disabled_hover_text("Select 0.2 seconds to 3 minutes of audio.")
-                .clicked()
-            {
-                app.analyze_beat_map(false);
-            }
-            small(
-                ui,
-                if app.selection().is_some() {
-                    "Analyzes the selection"
-                } else {
-                    "Analyzes the source"
-                },
-            );
-        });
-        model_setup(app, ui, ready, valid_range);
-        if let Some(proposal) = app.beat_proposal() {
-            let count = proposal.beats.len();
-            ui.horizontal_wrapped(|ui| {
-                small(ui, format!("{count} proposed beats · Blue on waveform"));
-                if action(ui, "Use analysis", true).clicked() {
-                    app.adopt_beat_proposal();
-                }
-                if action(ui, "Dismiss", true).clicked() {
-                    app.discard_beat_proposal();
-                }
-            });
+    let ready = app.analysis_job().is_none();
+    let duration = app.duration();
+    let range = app.selection().unwrap_or((0.0, duration));
+    let valid_range = (0.2..=analysis_worker::MAX_SECONDS).contains(&(range.1 - range.0));
+    ui.horizontal_wrapped(|ui| {
+        if command_button(ui, app, Action::AnalyzeBeats, "Analyze with pulse estimator").clicked() {
+            Action::AnalyzeBeats.run(app);
         }
-        let source = app.active_source;
-        let mut map = app
-            .studio
-            .beat_maps
-            .get(&source)
-            .cloned()
-            .unwrap_or_default();
-        let selection_id = ui.id().with(("beat_index", source));
-        let mut index = ui
-            .data(|data| data.get_temp::<usize>(selection_id))
-            .unwrap_or(0);
-        let mut changed = false;
+        small(
+            ui,
+            if app.selection().is_some() {
+                "Analyzes the selection"
+            } else {
+                "Analyzes the source"
+            },
+        );
+    });
+    model_setup(app, ui, ready, valid_range);
+    if let Some(proposal) = app.beat_proposal() {
+        let count = proposal.beats.len();
         ui.horizontal_wrapped(|ui| {
-            if action(
-                ui,
-                "Add beat at playhead",
-                (0.0..=duration).contains(&app.position),
-            )
-            .clicked()
-                && let Some(added) = Arc::make_mut(&mut map).add(app.position, duration)
-            {
-                index = added;
-                changed = true;
+            small(ui, format!("{count} proposed beats · Blue on waveform"));
+            if action(ui, "Use analysis", true).clicked() {
+                app.adopt_beat_proposal();
             }
-            if action(ui, "Half tempo", map.beats.len() >= 3).clicked() {
-                Arc::make_mut(&mut map).reinterpret(false, duration);
-                changed = true;
-            }
-            if action(ui, "Double tempo", map.beats.len() >= 2).clicked() {
-                Arc::make_mut(&mut map).reinterpret(true, duration);
-                changed = true;
-            }
-            if action(
-                ui,
-                "Clear inferred beats",
-                map.beats.iter().any(|beat| !beat.anchor),
-            )
-            .clicked()
-            {
-                Arc::make_mut(&mut map).clear_analysis();
-                changed = true;
+            if action(ui, "Dismiss", true).clicked() {
+                app.discard_beat_proposal();
             }
         });
-        if !map.beats.is_empty() {
-            index = index.min(map.beats.len() - 1);
-            ui.horizontal_wrapped(|ui| {
-                let mut number = index + 1;
-                ui.add(
-                    DragValue::new(&mut number)
-                        .range(1..=map.beats.len())
-                        .prefix("Beat "),
-                );
-                index = number - 1;
-                let beat = map.beats[index];
-                let mut at = beat.seconds;
-                if ui
-                    .add(
-                        DragValue::new(&mut at)
-                            .range(0.0..=duration)
-                            .speed(0.002)
-                            .max_decimals(3)
-                            .suffix(" s"),
-                    )
-                    .changed()
-                {
-                    changed |= Arc::make_mut(&mut map).move_beat(index, at, duration);
-                }
-                if action(ui, "Show beat", true).clicked() {
-                    app.seek(at);
-                    app.waveform.center_on(at, duration);
-                }
-                if action(ui, "Set first downbeat", true).clicked() {
-                    Arc::make_mut(&mut map).set_downbeat(index);
-                    changed = true;
-                }
-                if action(ui, "Remove beat", true).clicked() {
-                    Arc::make_mut(&mut map).remove(index);
-                    changed = true;
-                }
-                if beat.anchor {
-                    small(ui, "User anchor");
-                } else if let Some(evidence) = beat.confidence {
-                    small(
-                        ui,
-                        if evidence >= 0.3 {
-                            "Strong transient evidence"
-                        } else {
-                            "Weak transient evidence"
-                        },
-                    );
-                }
-            });
-            ui.horizontal_wrapped(|ui| {
-                if action(
-                    ui,
-                    "Set suggested phrase starts",
-                    map.beats.iter().any(|beat| beat.downbeat),
-                )
-                .clicked()
-                    && let Some(clip) = app.active_clip()
-                {
-                    Arc::make_mut(&mut map).suggest_phrases(clip);
-                    changed = true;
-                }
-                let phrase = map
-                    .beats
-                    .get(index)
-                    .is_some_and(|beat| map.phrases.contains(&beat.seconds));
-                if action(
-                    ui,
-                    if phrase {
-                        "Remove phrase start"
-                    } else {
-                        "Mark phrase start"
-                    },
-                    !map.beats.is_empty(),
-                )
-                .clicked()
-                {
-                    Arc::make_mut(&mut map).toggle_phrase(index);
-                    changed = true;
-                }
-                small(
-                    ui,
-                    format!(
-                        "{} beats · {} phrase starts",
-                        map.beats.len(),
-                        map.phrases.len()
-                    ),
-                );
-            });
+    }
+    let source = app.active_source;
+    let mut map = app
+        .studio
+        .beat_maps
+        .get(&source)
+        .cloned()
+        .unwrap_or_default();
+    let selection_id = ui.id().with(("beat_index", source));
+    let mut index = ui
+        .data(|data| data.get_temp::<usize>(selection_id))
+        .unwrap_or(0);
+    let mut changed = false;
+    ui.horizontal_wrapped(|ui| {
+        if action(
+            ui,
+            "Add beat at playhead",
+            (0.0..=duration).contains(&app.position),
+        )
+        .clicked()
+            && let Some(added) = Arc::make_mut(&mut map).add(app.position, duration)
+        {
+            index = added;
+            changed = true;
         }
-        ui.data_mut(|data| data.insert_temp(selection_id, index));
-        if changed {
-            app.studio.beat_maps.insert(source, map.clone());
+        if action(ui, "Half tempo", map.beats.len() >= 3).clicked() {
+            Arc::make_mut(&mut map).reinterpret(false, duration);
+            changed = true;
         }
-        if let Some(provenance) = &map.provenance {
-            small(
-                ui,
-                format!(
-                    "Last accepted analysis · {} {} · {:.2}–{:.2} s",
-                    provenance.model, provenance.version, provenance.range.0, provenance.range.1
-                ),
-            );
+        if action(ui, "Double tempo", map.beats.len() >= 2).clicked() {
+            Arc::make_mut(&mut map).reinterpret(true, duration);
+            changed = true;
         }
         if action(
             ui,
-            "Preview warp from beat map",
-            map.beats.len() >= 2 && !app.recording,
+            "Clear inferred beats",
+            map.beats.iter().any(|beat| !beat.anchor),
         )
         .clicked()
         {
-            app.prepare_mapped_warp();
+            Arc::make_mut(&mut map).clear_analysis();
+            changed = true;
         }
     });
-    warp_preview(app, ui);
+    if !map.beats.is_empty() {
+        index = index.min(map.beats.len() - 1);
+        ui.horizontal_wrapped(|ui| {
+            let mut number = index + 1;
+            ui.add(
+                DragValue::new(&mut number)
+                    .range(1..=map.beats.len())
+                    .prefix("Beat "),
+            );
+            index = number - 1;
+            let beat = map.beats[index];
+            let mut at = beat.seconds;
+            if ui
+                .add(
+                    DragValue::new(&mut at)
+                        .range(0.0..=duration)
+                        .speed(0.002)
+                        .max_decimals(3)
+                        .suffix(" s"),
+                )
+                .changed()
+            {
+                changed |= Arc::make_mut(&mut map).move_beat(index, at, duration);
+            }
+            if action(ui, "Show beat", true).clicked() {
+                app.seek(at);
+                app.waveform.center_on(at, duration);
+            }
+            if action(ui, "Set first downbeat", true).clicked() {
+                Arc::make_mut(&mut map).set_downbeat(index);
+                changed = true;
+            }
+            if action(ui, "Remove beat", true).clicked() {
+                Arc::make_mut(&mut map).remove(index);
+                changed = true;
+            }
+            if beat.anchor {
+                small(ui, "User anchor");
+            } else if let Some(evidence) = beat.confidence {
+                small(
+                    ui,
+                    if evidence >= 0.3 {
+                        "Strong transient evidence"
+                    } else {
+                        "Weak transient evidence"
+                    },
+                );
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            if action(
+                ui,
+                "Set suggested phrase starts",
+                map.beats.iter().any(|beat| beat.downbeat),
+            )
+            .clicked()
+                && let Some(clip) = app.active_clip()
+            {
+                Arc::make_mut(&mut map).suggest_phrases(clip);
+                changed = true;
+            }
+            let phrase = map
+                .beats
+                .get(index)
+                .is_some_and(|beat| map.phrases.contains(&beat.seconds));
+            if action(
+                ui,
+                if phrase {
+                    "Remove phrase start"
+                } else {
+                    "Mark phrase start"
+                },
+                !map.beats.is_empty(),
+            )
+            .clicked()
+            {
+                Arc::make_mut(&mut map).toggle_phrase(index);
+                changed = true;
+            }
+            small(
+                ui,
+                format!(
+                    "{} beats · {} phrase starts",
+                    map.beats.len(),
+                    map.phrases.len()
+                ),
+            );
+        });
+    }
+    ui.data_mut(|data| data.insert_temp(selection_id, index));
+    if changed {
+        app.studio.beat_maps.insert(source, map.clone());
+    }
+    if let Some(provenance) = &map.provenance {
+        small(
+            ui,
+            format!(
+                "Last accepted analysis · {} {} · {:.2}–{:.2} s",
+                provenance.model, provenance.version, provenance.range.0, provenance.range.1
+            ),
+        );
+    }
+    if action(
+        ui,
+        "Preview warp from beat map",
+        map.beats.len() >= 2 && !app.recording,
+    )
+    .clicked()
+    {
+        app.prepare_mapped_warp();
+    }
 }
 
 fn model_setup(app: &mut App, ui: &mut Ui, ready: bool, valid_range: bool) {
@@ -231,7 +227,7 @@ fn model_setup(app: &mut App, ui: &mut Ui, ready: bool, valid_range: bool) {
     });
 }
 
-fn warp_preview(app: &mut App, ui: &mut Ui) {
+pub(super) fn warp_preview(app: &mut App, ui: &mut Ui) {
     let Some(preview) = app.warp_preview() else {
         return;
     };
@@ -264,6 +260,7 @@ fn warp_preview(app: &mut App, ui: &mut Ui) {
         }
         if action(ui, "Edit bounds and markers", app.warp_preview().is_some()).clicked() {
             app.edit_warp_proposal();
+            app.sample_tool = Some(super::sample::Tool::Warp);
         }
         if action(ui, "Dismiss preview", app.warp_preview().is_some()).clicked() {
             app.discard_warp_preview();

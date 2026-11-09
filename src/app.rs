@@ -1,3 +1,4 @@
+pub(crate) mod actions;
 mod audition_workflow;
 mod beat_workflow;
 mod extraction_workflow;
@@ -10,6 +11,7 @@ mod taste_workflow;
 pub(crate) mod transcription_workflow;
 mod project_session;
 
+use actions::Action;
 use crate::{
     analysis::{AudioProfile, Emphasis, MatchBy, Sound},
     audio::{CapturedChop, Clip, Command, Output, PadMode},
@@ -35,7 +37,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
     Dig,
     Queue,
@@ -44,7 +46,7 @@ pub enum Page {
     Crate,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StudioView {
     Sample,
     Perform,
@@ -148,6 +150,13 @@ enum PendingChange {
     Quit,
 }
 
+#[derive(Clone)]
+struct QueueAudio {
+    source: Source,
+    clip: Arc<Clip>,
+    matched_range: Option<(f64, f64)>,
+}
+
 #[derive(Clone, Copy)]
 pub struct SceneRun {
     pub pattern: usize,
@@ -182,7 +191,7 @@ pub struct App {
     taste: taste_workflow::Taste,
     pub queue_marked: HashSet<Source>,
     pub queue_level_match: bool,
-    queue_audio: Option<(Source, Arc<Clip>, Option<(f64, f64)>)>,
+    queue_audio: Option<QueueAudio>,
     queue_range: Option<(f64, f64)>,
     pub queue_focus: Option<Source>,
     pub queue_advance: bool,
@@ -304,6 +313,8 @@ pub struct App {
     pub bar_clipboard: Option<BarContent>,
     pub drum_templates: Option<crate::ui::drum_templates::Browser>,
     pub(crate) sequence_tool: Option<crate::ui::sequencer::Tool>,
+    pub(crate) sample_tool: Option<crate::ui::sample::Tool>,
+    pub(crate) reveal_audio_output: bool,
     pub variations: Option<crate::ui::variation::Dialog>,
     pub snapshot_dialog: Option<crate::ui::snapshots::Dialog>,
     pub snapshots: Arc<Vec<crate::model::snapshot::NamedSnapshot>>,
@@ -486,6 +497,8 @@ impl App {
             bar_clipboard: None,
             drum_templates: None,
             sequence_tool: None,
+            sample_tool: None,
+            reveal_audio_output: false,
             variations: None,
             snapshot_dialog: None,
             snapshots: Arc::default(),
@@ -989,7 +1002,11 @@ impl App {
                 self.persist_library();
             }
             Job::Listen(source, clip, range) if self.page == Page::Queue && self.output.is_some() => {
-                self.queue_audio = Some((source, Arc::new(clip), range));
+                self.queue_audio = Some(QueueAudio {
+                    source,
+                    clip: Arc::new(clip),
+                    matched_range: range,
+                });
                 self.play_queue_audio(None);
             }
             Job::Listen(..) => {}
@@ -1476,7 +1493,7 @@ impl App {
             self.stop_listening();
             return;
         }
-        if self.queue_audio.as_ref().is_some_and(|(source, _, _)| *source == entry.record.source) {
+        if self.queue_audio.as_ref().is_some_and(|audio| audio.source == entry.record.source) {
             self.play_queue_audio(None);
             return;
         }
@@ -1487,7 +1504,9 @@ impl App {
     }
 
     fn play_queue_audio(&mut self, seek: Option<f64>) {
-        let Some((source, clip, matched)) = self.queue_audio.clone() else { return };
+        let Some(QueueAudio { source, clip, matched_range }) = self.queue_audio.clone() else {
+            return;
+        };
         if self.output.is_none() { return; }
         let duration = clip.duration();
         let seconds = self.queue_preview_seconds;
@@ -1495,7 +1514,7 @@ impl App {
         let range = if let Some(seek) = seek {
             let start = seek.clamp(0.0, (duration - 0.005).max(0.0));
             (start, (start + seconds).min(duration))
-        } else { matched.unwrap_or((start, (start + seconds).min(duration))) };
+        } else { matched_range.unwrap_or((start, (start + seconds).min(duration))) };
         let gain = if self.queue_level_match {
             let (sum, count) = clip.region(range).unwrap_or_default().iter().step_by(
                 ((range.1 - range.0) * f64::from(clip.rate) / 8192.0).round().max(1.0) as usize,
@@ -1525,7 +1544,7 @@ impl App {
     }
 
     pub fn queue_audition(&self) -> Option<(f64, f64)> {
-        let (source, clip, _) = self.queue_audio.as_ref()?;
+        let QueueAudio { source, clip, .. } = self.queue_audio.as_ref()?;
         let focused = self.queue_focused()?;
         if self.library.queue[focused].record.source != *source { return None; }
         let range = self.queue_range.unwrap_or((0.0, clip.duration()));
@@ -3609,13 +3628,13 @@ impl App {
     }
 
     fn selected_chop_controls(&mut self) -> &mut SampleControls {
-        if self.library.midi.piano_view && self.studio.chromatic_enabled
-            && self.studio.chromatic.is_some()
-        {
-            return &mut self.studio.chromatic.as_mut().unwrap().controls;
-        }
         if self.library.midi.piano_view {
             let inherited = self.studio.controls_for_key(self.piano_key);
+            if self.studio.chromatic_enabled
+                && let Some(chromatic) = &mut self.studio.chromatic
+            {
+                return &mut chromatic.controls;
+            }
             self.studio
                 .key_controls
                 .entry(self.piano_key)
@@ -4049,24 +4068,23 @@ impl App {
         if self.show_commands || self.drum_templates.is_some() || self.variations.is_some()
             || self.snapshot_dialog.is_some()
         { return; }
-        if pressed(Key::K, true, Some(false)) {
-            self.open_commands();
+        if Action::Commands.pressed(pressed) {
+            Action::Commands.run(self);
             return;
         }
         let (focused, popup) = ctx.memory(|memory| (memory.focused(), memory.any_popup_open()));
         let editing_text = focused.is_some_and(|id| egui::TextEdit::load_state(ctx, id).is_some());
         if self.youtube_url.is_none() && !self.daw_dialog && !self.midi_dialog && self.export_dialog.is_none() {
-            let shortcut = |key, shift| pressed(key, true, Some(shift));
-            if shortcut(Key::S, true) {
-                self.save_project(true);
-            } else if shortcut(Key::S, false) {
-                self.save_dialog();
+            if Action::SaveAs.pressed(pressed) {
+                Action::SaveAs.run(self);
+            } else if Action::Save.pressed(pressed) {
+                Action::Save.run(self);
             }
             if !popup && !editing_text {
-                if shortcut(Key::Z, true) || shortcut(Key::Y, false) {
-                    self.undo_project(true);
-                } else if shortcut(Key::Z, false) {
-                    self.undo_project(false);
+                if Action::Redo.pressed(pressed) {
+                    Action::Redo.run(self);
+                } else if Action::Undo.pressed(pressed) {
+                    Action::Undo.run(self);
                 }
             }
         }
@@ -4081,12 +4099,11 @@ impl App {
             return;
         }
         let key = |key| pressed(key, false, None);
-        let command = |key| pressed(key, true, Some(false));
-        if command(Key::O) {
-            self.open_dialog();
+        if Action::Open.pressed(pressed) {
+            Action::Open.run(self);
         }
-        if command(Key::I) {
-            self.import();
+        if Action::Import.pressed(pressed) {
+            Action::Import.run(self);
         }
         if popup || editing_text {
             return;
@@ -4124,11 +4141,11 @@ impl App {
             }
             return;
         }
-        if focused.is_none() && key(Key::Space) {
-            self.toggle_preview();
+        if focused.is_none() && Action::Preview.pressed(pressed) {
+            Action::Preview.run(self);
         }
-        if focused.is_none() && key(Key::Enter) {
-            self.toggle_pattern();
+        if focused.is_none() && Action::Pattern.pressed(pressed) {
+            Action::Pattern.run(self);
         }
         if key(Key::Backtick) {
             self.keyboard = !self.keyboard;
@@ -4182,14 +4199,10 @@ impl App {
                     Page::Studio
                 };
             }
-            if key(Key::Z) && self.clip.is_some() {
-                self.set_loop_edge(true);
-            }
-            if key(Key::C) && self.clip.is_some() {
-                self.set_loop_edge(false);
-            }
-            if key(Key::X) {
-                self.toggle_loop();
+            for action in [Action::LoopIn, Action::LoopOut, Action::ToggleLoop] {
+                if action.pressed(pressed) {
+                    action.run(self);
+                }
             }
         }
         if key(Key::B) {

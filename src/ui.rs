@@ -1,5 +1,5 @@
 use crate::{
-    app::{App, Page, Pool, StudioView},
+    app::{App, Page, Pool, StudioView, actions::Action},
     audio::{Command, PadMode},
     midi::{Route, Target},
     model::{
@@ -7,7 +7,7 @@ use crate::{
         MIN_LOOP_SECONDS, PAD_LABELS, PIANO_HIGH, PIANO_LOW, Quantize, ReleaseInfo, STEPS,
         SampleControls, Source, Studio, Verdict, piano_note,
     },
-    waveform::{Snap, WaveformView, transient_near},
+    waveform::{Snap, WaveformView},
 };
 use eframe::egui::{
     self, Align, Align2, Button, Color32, ComboBox, Context, CornerRadius, DragValue, FontId,
@@ -29,6 +29,7 @@ pub(crate) mod export;
 pub(crate) mod piano_roll;
 pub(crate) mod preferences;
 pub(crate) mod sequencer;
+pub(crate) mod sample;
 mod step_grid;
 
 const BG: Color32 = Color32::from_rgb(13, 12, 11);
@@ -144,6 +145,18 @@ fn action(ui: &mut Ui, text: &str, enabled: bool) -> Response {
     let response = ui.add_enabled(enabled, Button::new(label(text, 13.0, TEXT)));
     focus_outline(ui, &response);
     response
+}
+
+fn command_button(ui: &mut Ui, app: &App, command: Action, text: &str) -> Response {
+    let reason = command.unavailable(app);
+    let response = action(ui, text, reason.is_none());
+    if let Some(reason) = reason {
+        response.on_disabled_hover_text(reason)
+    } else if !command.shortcut_text().is_empty() {
+        response.on_hover_text(command.shortcut_text())
+    } else {
+        response
+    }
 }
 
 fn primary(ui: &mut Ui, text: &str, enabled: bool) -> Response {
@@ -774,50 +787,30 @@ fn header(app: &mut App, ui: &mut Ui) {
             (Page::Crate, "Crate"),
         ] {
             if pill(ui, title, app.page == page).clicked() {
-                if page == Page::Search { app.open_search(); } else { app.page = page; }
+                Action::Page(page).run(app);
             }
         }
     };
     let controls = |ui: &mut Ui, app: &mut App| {
             if action(ui, "Help", true).on_hover_text("Commands and settings · Ctrl+K").clicked() {
-                app.open_commands();
+                Action::Commands.run(app);
             }
-            let ready = app.busy.is_none();
-            if primary(ui, "+ Import audio", ready)
+            if primary(ui, "+ Import audio", Action::Import.unavailable(app).is_none())
                 .on_hover_text("Import or drop WAV, MP3, FLAC, Ogg or M4A")
                 .clicked()
             {
-                app.import();
+                Action::Import.run(app);
             }
-            if action(ui, "YouTube URL", ready).clicked() {
-                app.status = None;
-                app.youtube_url = Some(String::new());
+            if command_button(ui, app, Action::ImportYouTube, "YouTube URL").clicked() {
+                Action::ImportYouTube.run(app);
             }
-            ui.add_enabled_ui(ready, |ui| {
+            ui.add_enabled_ui(Action::Open.unavailable(app).is_none(), |ui| {
                 ui.menu_button("Project", |ui| {
-                    if ui.button("Open project…").clicked() {
-                        ui.close_menu();
-                        app.open_dialog();
-                    }
-                    if ui.button("Save project").clicked() {
-                        ui.close_menu();
-                        app.save_dialog();
-                    }
-                    if ui.button("Save project as…").clicked() {
-                        ui.close_menu();
-                        app.save_project(true);
-                    }
-                    if ui.button("New from template…").clicked() {
-                        ui.close_menu();
-                        app.new_from_template();
-                    }
-                    if ui.button("Save as template…").clicked() {
-                        ui.close_menu();
-                        app.save_template();
-                    }
-                    if app.can_recover() && ui.button("Recover session…").clicked() {
-                        ui.close_menu();
-                        app.show_recovery();
+                    for command in [Action::Open, Action::Save, Action::SaveAs, Action::NewFromTemplate, Action::SaveTemplate, Action::Recover] {
+                        if command_button(ui, app, command, command.title()).clicked() {
+                            ui.close_menu();
+                            command.run(app);
+                        }
                     }
                     ui.separator();
                     ui.label("Recent projects");
@@ -1904,28 +1897,18 @@ fn crate_panel(app: &mut App, ui: &mut Ui) {
 }
 
 fn studio_transport(app: &mut App, ui: &mut Ui) {
-    let ready = app.output.is_some();
     let pattern = app.playing && app.song_playing.is_none();
     let song = app.song_playing.is_some();
     ui.horizontal_wrapped(|ui| {
-        if action(ui, if app.preview { "Pause source" } else { "Preview source" }, ready && app.clip.is_some())
-            .on_hover_text("Space previews the loaded source").clicked()
-        {
-            app.toggle_preview();
-        }
-        if action(ui, if pattern { "Stop pattern" } else { "Play pattern" }, ready)
-            .on_hover_text("Enter plays the current pattern").clicked()
-        {
-            app.toggle_pattern();
-        }
-        let song_ready = (1..=crate::model::MAX_SONG_BARS).contains(&app.studio.song_bars());
-        if action(ui, if song { "Stop song" } else { "Play song" }, ready && song_ready && !app.recording)
-            .on_hover_text("Arrange at least one section to play the song").clicked()
-        {
-            if song { app.stop_song(); } else { app.play_song(); }
-        }
-        if action(ui, "Stop all", ready).clicked() {
-            app.stop_all();
+        for (command, title) in [
+            (Action::Preview, if app.preview { "Pause source" } else { "Preview source" }),
+            (Action::Pattern, if pattern { "Stop pattern" } else { "Play pattern" }),
+            (Action::Song, if song { "Stop song" } else { "Play song" }),
+            (Action::Stop, "Stop all"),
+        ] {
+            if command_button(ui, app, command, title).clicked() {
+                command.run(app);
+            }
         }
         if let Some(take) = &app.input_recording {
             ui.label(label(format!("Recording input · {:.1} s", take.seconds()), 12.0, GOLD));
@@ -1974,18 +1957,13 @@ fn studio_header(app: &mut App, ui: &mut Ui) {
             (StudioView::Mix, "Mix"),
         ] {
             if pill(ui, title, app.studio_view == view).clicked() {
-                if view == StudioView::Arrange {
-                    app.open_arrangement();
-                } else {
-                    app.arrangement_timeline.cancel_drag();
-                    app.studio_view = view;
-                }
+                Action::Studio(view).run(app);
             }
         }
         project_history(app, ui);
         let ready = app.busy.is_none();
-        if action(ui, "Export…", ready).clicked() {
-            app.export_dialog = Some(export::Dialog::new(app));
+        if command_button(ui, app, Action::Export, "Export…").clicked() {
+            Action::Export.run(app);
         }
         if action(ui, "Dig another", ready).clicked() {
             app.dig();
@@ -1999,24 +1977,13 @@ fn studio(app: &mut App, ui: &mut Ui) {
         sequencer::show(app, ui);
         return;
     }
-    if view == StudioView::Sample && app.library.interface.show_pads && ui.available_width() >= 980.0 {
-        let width = app.library.interface.pads_width.clamp(330.0, ui.available_width() * 0.56);
-        let panel = egui::SidePanel::right("sample_performance")
-            .default_width(width)
-            .width_range(330.0..=ui.available_width() * 0.56)
-            .resizable(true)
-            .frame(Frame::new().fill(PANEL).inner_margin(Margin::same(8)))
-            .show_inside(ui, |ui| {
-                ScrollArea::vertical().id_salt("sample_pads").show(ui, |ui| performance_panel(app, ui));
-            });
-        if ui.input(|input| input.pointer.any_released()) && (panel.response.rect.width() - width).abs() > 2.0 {
-            app.library.interface.pads_width = panel.response.rect.width();
-            app.persist_library();
-        }
+    if view == StudioView::Sample {
+        sample::show(app, ui);
+        return;
     }
     ScrollArea::vertical()
         .id_salt(match view {
-            StudioView::Sample => "sample",
+            StudioView::Sample => unreachable!(),
             StudioView::Perform => "perform",
             StudioView::Sequence => unreachable!(),
             StudioView::Arrange => "arrangement",
@@ -2024,135 +1991,12 @@ fn studio(app: &mut App, ui: &mut Ui) {
         })
         .auto_shrink([false, false])
         .show(ui, |ui| match view {
-            StudioView::Sample => sample_panel(app, ui),
+            StudioView::Sample => unreachable!(),
             StudioView::Perform => performance_panel(app, ui),
             StudioView::Sequence => unreachable!(),
             StudioView::Arrange => arrangement::show(app, ui),
             StudioView::Mix => mixer_panel(app, ui),
         });
-}
-
-fn sample_panel(app: &mut App, ui: &mut Ui) {
-    ui.horizontal_wrapped(|ui| {
-        let selected = app.source_record(app.active_source)
-            .map_or("No audio loaded", |record| record.title.as_str());
-        let mut source = app.active_source;
-        ComboBox::from_id_salt("project_source")
-            .selected_text(selected)
-            .width(ui.available_width().min(250.0))
-            .show_ui(ui, |ui| {
-                for index in 0..=app.studio.sources.len() {
-                    if let Some(record) = app.source_record(index) {
-                        ui.selectable_value(&mut source, index, &record.title);
-                    }
-                }
-            });
-        app.select_source(source);
-        if action(ui, "Add audio source…", app.can_add_source())
-            .on_hover_text("Add audio to this project and keep your existing assignments")
-            .clicked()
-        {
-            app.add_source();
-        }
-    });
-    ui.collapsing("Record audio input", |ui| {
-        let active = app.input_recording.is_some();
-        ui.horizontal_wrapped(|ui| {
-            ui.add_enabled_ui(!active, |ui| {
-                let name = app.input_device.clone();
-                ComboBox::from_id_salt("audio_input_device")
-                    .selected_text(name.as_deref().unwrap_or("System default input"))
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut app.input_device, None, "System default input");
-                        for name in crate::input_audio::devices() {
-                            ui.selectable_value(&mut app.input_device, Some(name.clone()), name);
-                        }
-                    });
-            });
-            if ui.add_enabled(app.output.is_some(), egui::Checkbox::new(&mut app.input_monitor, "Monitor input"))
-                .on_hover_text("Use headphones when monitoring a microphone.").changed()
-                && let Some(take) = &app.input_recording
-            {
-                take.monitor(app.input_monitor);
-            }
-            if active {
-                if action(ui, "Finish input", true).clicked() { app.finish_input(); }
-            } else if primary(ui, "Record input", app.can_add_source() && !app.recording).clicked() {
-                app.record_input();
-            }
-        });
-        small(ui, "Record up to five minutes. Finishing adds the take as a project source.");
-    });
-    loop_panel(app, ui);
-    if action(ui, "Transcribe to notes…", app.clip.is_some() && !app.recording).clicked() {
-        app.open_transcription();
-    }
-    beat_map::panel(app, ui);
-    groove::panel(app, ui, true);
-    warp_editor(app, ui);
-    if app.clip.is_some() {
-        extraction::panel(app, ui);
-        ui.collapsing("Stem separation", |ui| {
-            small(ui, "Demucs processes the selection locally and adds vocals, drums, bass, and other as separate sources. Its first run may download model weights.");
-            ui.horizontal_wrapped(|ui| {
-                let executable = app.demucs_path.as_ref().and_then(|path| path.file_name())
-                    .map_or_else(|| "demucs on PATH".into(), |name| name.to_string_lossy().into_owned());
-                small(ui, executable);
-                if action(ui, "Choose Demucs executable…", app.busy.is_none()).clicked() {
-                    app.demucs_path = rfd::FileDialog::new().set_title("Choose the Demucs executable").pick_file()
-                        .or(app.demucs_path.take());
-                }
-                let space = app.studio.sources.len() + 1 + crate::separation::STEMS.len() <= crate::model::MAX_SOURCES;
-                if action(ui, if app.selection().is_some() { "Separate selection" } else { "Separate source" },
-                    app.can_add_source() && space && !app.recording).clicked()
-                {
-                    app.separate_stems();
-                }
-            });
-        });
-    }
-    if app.clip.is_some() {
-        panel().show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if action(ui, "Suggest cuts", app.busy.is_none()).clicked() {
-                    app.suggest_cuts();
-                }
-                ui.add(DragValue::new(&mut app.suggestion_bars).range(1..=8).suffix(" bars"))
-                    .on_hover_text("Passage length at the current project tempo");
-                ComboBox::from_id_salt("suggestion_emphasis").selected_text(app.suggestion_emphasis.label())
-                    .show_ui(ui, |ui| {
-                        for (mode, name) in crate::analysis::Emphasis::OPTIONS {
-                            ui.selectable_value(&mut app.suggestion_emphasis, mode, name);
-                        }
-                    });
-            });
-            for index in 0..app.suggestions.len() {
-                let mut select = false;
-                let mut save = false;
-                let mut play = false;
-                let suggestion = &app.suggestions[index];
-                let range = suggestion.range();
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(label(&suggestion.name, 13.0, GOLD));
-                    small(
-                        ui,
-                        format!("{} – {}", time(range.0, true), time(range.1, true)),
-                    );
-                    select = action(ui, "Select range", true).clicked();
-                    play = action(ui, "Audition", app.output.is_some() && !app.playing).clicked();
-                    save = action(ui, "Save cut", app.samples.len() < MAX_NAMED_SAMPLES).clicked();
-                });
-                if select || save {
-                    app.select_suggestion(index, save);
-                }
-                if play {
-                    app.audition_range(range);
-                }
-            }
-        });
-    }
-    ui.add_space(6.0);
-    samples_panel(app, ui);
 }
 
 fn performance_panel(app: &mut App, ui: &mut Ui) {
@@ -2173,8 +2017,8 @@ fn performance_panel(app: &mut App, ui: &mut Ui) {
         } else {
             format!("MIDI devices · {connected}")
         };
-        if action(ui, &midi, true).clicked() {
-            app.midi_dialog = true;
+        if command_button(ui, app, Action::MidiSetup, &midi).clicked() {
+            Action::MidiSetup.run(app);
         }
         if app.recording && pill(ui, "● Finish recording", true).clicked() {
             app.toggle_recording();
@@ -2275,18 +2119,17 @@ fn loop_panel(app: &mut App, ui: &mut Ui) {
         ui.set_width(ui.available_width());
         let ready = app.clip.is_some();
         ui.horizontal(|ui| {
-            if action(
-                ui,
+            if command_button(
+                ui, app, Action::Preview,
                 if app.preview {
                     "Ⅱ Pause"
                 } else {
                     "▶ Preview"
                 },
-                ready && app.output.is_some(),
             )
             .clicked()
             {
-                app.toggle_preview();
+                Action::Preview.run(app);
             }
             let title = app
                 .source_record(app.active_source)
@@ -2340,8 +2183,8 @@ fn loop_panel(app: &mut App, ui: &mut Ui) {
             });
         });
         ui.horizontal_wrapped(|ui| {
-            if action(ui, "In   Z", ready).clicked() {
-                app.set_loop_edge(true);
+            if command_button(ui, app, Action::LoopIn, "In   Z").clicked() {
+                Action::LoopIn.run(app);
             }
             let loop_button = Button::new(label(
                 "Loop   X",
@@ -2350,13 +2193,13 @@ fn loop_panel(app: &mut App, ui: &mut Ui) {
             ))
             .fill(if app.studio.looping { GREEN_BG } else { INSET });
             if ui
-                .add_enabled(app.selection().is_some(), loop_button)
+                .add_enabled(Action::ToggleLoop.unavailable(app).is_none(), loop_button)
                 .clicked()
             {
-                app.toggle_loop();
+                Action::ToggleLoop.run(app);
             }
-            if action(ui, "Out   C", ready).clicked() {
-                app.set_loop_edge(false);
+            if command_button(ui, app, Action::LoopOut, "Out   C").clicked() {
+                Action::LoopOut.run(app);
             }
             if action(ui, "Use full sample", ready).clicked() {
                 app.set_loop_range((0.0, app.duration()));
@@ -2373,35 +2216,11 @@ fn loop_panel(app: &mut App, ui: &mut Ui) {
                 app.studio.loop_out = None;
                 app.studio.looping = false;
             }
-            ui.add_enabled_ui(app.selection().is_some() && app.can_add_source() && !app.recording, |ui| {
-                ui.menu_button("Fit to bars…", |ui| {
-                    small(ui, "Prepares a pitch-preserved preview at the current BPM.");
-                    for bars in [1, 2, 4, 8] {
-                        let seconds = 240.0 * bars as f64 / f64::from(app.studio.bpm);
-                        let enabled = app.selection().is_some_and(|(start, end)| {
-                            (0.5..=2.0).contains(&(seconds / (end - start)))
-                        });
-                        if action(ui, &format!("{bars} {} · {seconds:.2} s", if bars == 1 { "bar" } else { "bars" }), enabled)
-                            .on_disabled_hover_text("Choose a duration between half and twice the selection")
-                            .clicked()
-                        {
-                            app.stretch_selection(bars);
-                            ui.close_menu();
-                        }
-                    }
-                });
-            });
-            let selection = app.selection();
-            if action(
-                ui,
-                "Export loop WAV",
-                selection.is_some() && app.busy.is_none(),
-            )
+            if command_button(ui, app, Action::ExportLoop, "Export loop WAV")
             .on_hover_text("Export the selected source audio at its original sample rate")
             .clicked()
-                && let Some(range) = selection
             {
-                app.export_region(range, "loop.wav");
+                Action::ExportLoop.run(app);
             }
         });
         let duration = app.duration();
@@ -2412,59 +2231,6 @@ fn loop_panel(app: &mut App, ui: &mut Ui) {
                 time_control(ui, "OUT", &mut app.studio.loop_out, duration);
             });
         }
-    });
-}
-
-fn warp_editor(app: &mut App, ui: &mut Ui) {
-    if app.clip.is_none() { return; }
-    ui.collapsing("Warp markers", |ui| {
-        small(ui, "Select a range. Mark source positions and set the beat each position should land on, measured from the start of the new clip.");
-        let source = app.active_source;
-        let duration = app.duration();
-        let selection = app.selection();
-        let mut markers = app.studio.warp_markers.get(&source).cloned().unwrap_or_default();
-        let before = markers.clone();
-        let can_add = markers.len() < crate::stretch::Marker::MAX
-            && selection.is_some_and(|(start, end)| (start..end).contains(&app.position) && app.position > start);
-        if action(ui, "Add at playhead", can_add).on_disabled_hover_text("Seek inside the selected range first.").clicked() {
-            let start = selection.unwrap().0;
-            let beat = ((app.position - start) * f64::from(app.studio.bpm) / 60.0 * 4.0).round() / 4.0;
-            markers.push(crate::stretch::Marker { source_seconds: app.position, target_beat: beat.max(0.25) });
-            markers.sort_by(|a, b| a.source_seconds.total_cmp(&b.source_seconds));
-        }
-        let mut remove = None;
-        for (index, marker) in markers.iter_mut().enumerate() {
-            ui.push_id(index, |ui| ui.horizontal_wrapped(|ui| {
-                ui.label(format!("Marker {}", index + 1));
-                ui.add(DragValue::new(&mut marker.source_seconds).range(0.0..=duration).speed(0.01).suffix(" s"));
-                ui.add(DragValue::new(&mut marker.target_beat).range(0.25..=127.75).speed(0.25).prefix("Beat "));
-                if action(ui, "Seek", true).clicked() { app.seek(marker.source_seconds); }
-                if action(ui, "Remove", true).clicked() { remove = Some(index); }
-            }));
-        }
-        if let Some(index) = remove { markers.remove(index); }
-        if before != markers {
-            if markers.is_empty() { app.studio.warp_markers.remove(&source); }
-            else { app.studio.warp_markers.insert(source, markers); }
-        }
-        ui.add_enabled_ui(selection.is_some() && app.can_add_source(), |ui| {
-            ui.menu_button("Preview warped copy…", |ui| {
-                for bars in [1, 2, 4, 8, 16] {
-                    if ui.button(format!("Fit to {bars} bar(s)")).clicked() {
-                        app.warp_selection(bars);
-                        ui.close_menu();
-                    }
-                }
-                let id = ui.id().with("custom_target_beats");
-                let mut beats = ui.data(|data| data.get_temp::<usize>(id)).unwrap_or(16);
-                ui.add(DragValue::new(&mut beats).range(1..=128).prefix("Target beats "));
-                ui.data_mut(|data| data.insert_temp(id, beats));
-                if action(ui, "Preview custom length", true).clicked() {
-                    app.warp_selection_beats(beats);
-                    ui.close_menu();
-                }
-            });
-        });
     });
 }
 
@@ -3308,106 +3074,13 @@ fn pads(app: &mut App, ui: &mut Ui) {
 }
 
 fn slice_menu(app: &mut App, ui: &mut Ui) {
-    let Some((start, end)) = app.selection() else {
-        action(ui, "Slice selection…", false).on_disabled_hover_text("Select a waveform range first");
-        return;
-    };
-    ui.menu_button("Slice selection…", |ui| {
-        let count_id = ui.id().with("count");
-        let mode_id = ui.id().with("mode");
-        let division_id = ui.id().with("division");
-        let mut count = ui.data(|data| data.get_temp::<usize>(count_id)).unwrap_or(STEPS);
-        let mut division = ui.data(|data| data.get_temp::<usize>(division_id)).unwrap_or(1);
-        let mut mode = ui.data(|data| data.get_temp::<u8>(mode_id)).unwrap_or(0);
-        let sensitivity_id = ui.id().with("transient_sensitivity");
-        let mut sensitivity = ui.data(|data| data.get_temp::<u8>(sensitivity_id)).unwrap_or(35);
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut mode, 0, "Even");
-            ui.selectable_value(&mut mode, 1, "Beats");
-            ui.selectable_value(&mut mode, 4, "Bars");
-            ui.selectable_value(&mut mode, 2, "Transients");
-            ui.selectable_value(&mut mode, 3, "Warp markers");
-        });
-        let beat = 60.0 / f64::from(app.studio.bpm);
-        if mode == 1 {
-            ui.add(DragValue::new(&mut division).range(1..=4).prefix("Slices per beat "));
-        } else if mode != 3 && mode != 4 {
-            ui.add(DragValue::new(&mut count).range(2..=STEPS).prefix("Slices "));
-        }
-        if mode == 2 {
-            ui.add(egui::Slider::new(&mut sensitivity, 5..=45).text("Sensitivity"))
-                .on_hover_text("Higher sensitivity searches farther from each evenly spaced boundary");
-        }
-        ui.data_mut(|data| {
-            data.insert_temp(count_id, count);
-            data.insert_temp(division_id, division);
-            data.insert_temp(mode_id, mode);
-            data.insert_temp(sensitivity_id, sensitivity);
-        });
-        let mut boundaries = vec![start];
-        if mode == 1 || mode == 4 {
-            if let Some(map) = app.studio.beat_maps.get(&app.active_source) {
-                boundaries.extend(map.slice_points((start, end), mode == 4, division));
-                if boundaries.len() == 1 {
-                    small(ui, "Select a range containing beat or bar markers.");
-                }
-            } else if mode == 1 {
-                for index in 1..STEPS {
-                    let at = start + beat / division as f64 * index as f64;
-                    if at >= end - 0.001 { break; }
-                    boundaries.push(at);
-                }
-                small(ui, "Using a steady grid at the project tempo.");
-            } else {
-                small(ui, "Add bar starts in Beat map first.");
-            }
-        } else if mode == 3 {
-            if let Some(markers) = app.studio.warp_markers.get(&app.active_source) {
-                boundaries.extend(markers.iter().map(|marker| marker.source_seconds)
-                    .filter(|&at| start < at && at < end).take(STEPS - 1));
-            }
-            boundaries.sort_by(f64::total_cmp);
-            if boundaries.len() == 1 {
-                small(ui, "Add a warp marker inside the selection to split it here.");
-            }
-        } else {
-            let step = (end - start) / count as f64;
-            for index in 1..count {
-                let at = start + step * index as f64;
-                let adjusted = if mode == 2 {
-                    app.active_clip().map_or(at, |clip| transient_near(clip, at, (step * f64::from(sensitivity) / 100.0).min(0.2)))
-                } else {
-                    at
-                };
-                boundaries.push(adjusted);
-            }
-        }
-        if (mode == 4 || (mode == 1 && app.studio.beat_maps.contains_key(&app.active_source)))
-            && boundaries.len() < 2
-        {
-            return;
-        }
-        boundaries.push(end);
-        if boundaries.windows(2).any(|pair| pair[1] - pair[0] < 0.001) {
-            small(ui, "Select a longer range or use fewer slices.");
-            return;
-        }
-        small(ui, format!("{} slices. Applying replaces pad ranges.", boundaries.len() - 1));
-        ui.horizontal_wrapped(|ui| {
-            for (index, pair) in boundaries.windows(2).enumerate() {
-                if action(ui, &format!("Play {}", index + 1), app.output.is_some() && !app.playing)
-                    .on_hover_text(format!("{:.3}–{:.3} s", pair[0], pair[1]))
-                    .clicked()
-                {
-                    app.audition_range((pair[0], pair[1]));
-                }
+    ui.add_enabled_ui(app.selection().is_some(), |ui| {
+        ui.menu_button("Slice selection…", |ui| {
+            if sample::slice_controls(app, ui) {
+                ui.close_menu();
             }
         });
-        if primary(ui, "Apply slices", true).clicked() {
-            app.studio.apply_slices(&boundaries, app.active_source);
-            ui.close_menu();
-        }
-    });
+    }).response.on_disabled_hover_text("Select a waveform range first");
 }
 
 fn sample_controls(ui: &mut Ui, controls: &mut SampleControls) -> bool {
@@ -3899,14 +3572,10 @@ fn pad_cell(app: &mut App, ui: &mut Ui, index: usize, size: f32) {
 }
 
 fn project_history(app: &mut App, ui: &mut Ui) {
-    if action(ui, "Snapshots…", !app.recording).clicked() {
-        app.snapshot_dialog = Some(snapshots::Dialog::default());
-    }
-    if action(ui, "Undo", app.can_undo_project(false)).on_hover_text("Ctrl+Z").clicked() {
-        app.undo_project(false);
-    }
-    if action(ui, "Redo", app.can_undo_project(true)).on_hover_text("Ctrl+Shift+Z").clicked() {
-        app.undo_project(true);
+    for (command, title) in [(Action::Snapshots, "Snapshots…"), (Action::Undo, "Undo"), (Action::Redo, "Redo")] {
+        if command_button(ui, app, command, title).clicked() {
+            command.run(app);
+        }
     }
 }
 
@@ -3950,7 +3619,13 @@ fn mixer_panel(app: &mut App, ui: &mut Ui) {
             });
         });
         ui.separator();
-        ui.collapsing("Audio output", |ui| audio_output_controls(app, ui));
+        let reveal = std::mem::take(&mut app.reveal_audio_output);
+        let output = egui::CollapsingHeader::new("Audio output")
+            .open(reveal.then_some(true))
+            .show(ui, |ui| audio_output_controls(app, ui));
+        if reveal {
+            output.header_response.scroll_to_me(Some(Align::Center));
+        }
         ui.collapsing("Drum channels", |ui| {
                 ui.horizontal_wrapped(|ui| {
                     let ready = app.busy.is_none() && app.input_recording.is_none();

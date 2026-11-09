@@ -76,11 +76,7 @@ pub fn panel(app: &mut App, ui: &mut Ui, sample_view: bool) {
             if action(ui, "Apply groove", !app.recording && app.studio.has_pattern()).clicked() { app.apply_groove(); }
         });
     };
-    if sample_view {
-        ui.collapsing("Groove transfer", controls);
-    } else {
-        controls(ui);
-    }
+    controls(ui);
 }
 
 pub fn audition(app: &mut App, ui: &mut Ui) {

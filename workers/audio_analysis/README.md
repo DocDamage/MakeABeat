@@ -10,7 +10,7 @@ python -m venv .venv-beats
 .\.venv-beats\Scripts\python.exe -m pip install beat-this==1.1.0
 ```
 
-In **Studio → Sample → Beat map → Beat This! setup**, select the environment’s Python executable and check the environment. Use **Download verified weights** to install the 8.1 MiB `small0` checkpoint in application data. The app verifies its SHA-256 before running inference and passes the model an explicit local path. [Beat This! setup](https://github.com/CPJKU/beat_this#inference)
+In **Studio → Sample → Sample tools → Beat map → Beat This! setup**, select the environment’s Python executable and check the environment. Use **Download verified weights** to install the 8.1 MiB `small0` checkpoint in application data. The app verifies its SHA-256 before running inference and passes the model an explicit local path. [Beat This! setup](https://github.com/CPJKU/beat_this#inference)
 
 ## Protocol v1
 
@@ -65,7 +65,7 @@ $pitchPython = ".\.venv-pitch\Scripts\python.exe"
 & $pitchPython -m pip check
 ```
 
-In **Sample → Transcribe to notes → Basic Pitch setup**, choose that Python executable. The local worker verifies the included `nmp.onnx` checkpoint before inference. Its SHA-256 is `2c3c1d144bfa61ad236e92e169c13535c880469a12a047d4e73451f2c059a0ec`. The worker writes source-time note events and pitch contours to a temporary job directory. The app can cancel the process and removes its temporary audio when the job ends. [Basic Pitch](https://github.com/spotify/basic-pitch)
+In **Sample → Sample tools → Transcribe**, choose that Python executable. The local worker verifies the included `nmp.onnx` checkpoint before inference. Its SHA-256 is `2c3c1d144bfa61ad236e92e169c13535c880469a12a047d4e73451f2c059a0ec`. The worker writes source-time note events and pitch contours to a temporary job directory. The app can cancel the process and removes its temporary audio when the job ends. [Basic Pitch](https://github.com/spotify/basic-pitch)
 
 ### Transcription benchmark
 
@@ -108,7 +108,7 @@ $samInput = Join-Path $samProbe 'probe-input.wav'
 
 You can substitute a mono or stereo clip up to six seconds and a lowercase prompt describing the target. The six-second cap is for the probe. The text-only pass uses one candidate and skips loading the optional rankers and automatic span predictor. The script writes original, target, and residual mono WAVs at the model sample rate after validating their sample counts and finite values. It reports load time, inference time, and peak memory allocated by PyTorch on CUDA.
 
-In the app, open **Studio → Sample → Extract sound · Experimental**. The app detects the environment and shared FFmpeg folder at the paths above. If you used different paths, choose them in **SAM Audio setup**. Run the standalone probe once to cache the model and T5 encoder before extracting in the app, which uses the local cache. With a waveform selection of 0.10 to 6 seconds, enter a short description and click **Extract selection**. Preview the three mono outputs and save the target, residual, or both as project sources.
+In the app, open **Studio → Sample → Sample tools → Extract sound · Experimental**. The app detects the environment and shared FFmpeg folder at the paths above. If you used different paths, choose them in **SAM Audio setup**. Run the standalone probe once to cache the model and T5 encoder before extracting in the app, which uses the local cache. With a waveform selection of 0.10 to 6 seconds, enter a short description and click **Extract selection**. Preview the three mono outputs and save the target, residual, or both as project sources.
 
 ### Extraction benchmark
 

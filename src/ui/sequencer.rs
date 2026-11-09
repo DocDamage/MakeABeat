@@ -1,10 +1,11 @@
 use super::{
-    MINT, action, drum_templates, groove, label, named_number, panel, piano_roll, pill,
-    responsive_modal, small, step_grid, variation,
+    MINT, action, command_button, groove, label, named_number, panel, pill, responsive_modal,
+    small, step_grid, variation,
 };
 use crate::{
     app::{
         App,
+        actions::Action,
         sequence_workflow::{BarEdit, ClearLane, Edit},
     },
     audio::Command,
@@ -229,15 +230,11 @@ fn tools(app: &mut App, ui: &mut Ui, grid: &step_grid::State) {
             }
         }
         ui.separator();
-        if menu_action(
-            ui,
-            "Piano roll…",
-            !app.recording && (app.clip.is_some() || !app.studio.performance.is_empty()),
-        ) {
-            app.piano_roll = Some(piano_roll::PianoRoll::new(app));
-        }
-        if menu_action(ui, "Drum templates…", !app.recording) {
-            app.drum_templates = Some(drum_templates::Browser::default());
+        for command in [Action::PianoRoll, Action::Templates] {
+            if command_button(ui, app, command, command.title()).clicked() {
+                ui.close_menu();
+                command.run(app);
+            }
         }
         if menu_action(ui, "Generate variations…", can_select(app)) {
             let selected = grid
@@ -267,12 +264,9 @@ fn tools(app: &mut App, ui: &mut Ui, grid: &step_grid::State) {
         ) {
             app.resample_mix(false);
         }
-        if menu_action(
-            ui,
-            "Export MIDI…",
-            (app.studio.has_pattern() || !app.studio.sections.is_empty()) && app.busy.is_none(),
-        ) {
-            app.export("mid");
+        if command_button(ui, app, Action::ExportMidi, Action::ExportMidi.title()).clicked() {
+            ui.close_menu();
+            Action::ExportMidi.run(app);
         }
     });
 }

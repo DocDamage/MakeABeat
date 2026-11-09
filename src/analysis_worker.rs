@@ -150,7 +150,7 @@ pub fn fingerprint_frames(rate: u32, frames: &[crate::audio::Frame]) -> Result<S
     let mut bytes = [0_u8; 4096 * 8];
     for block in frames.chunks(4096) {
         background::check()?;
-        for (frame, slot) in block.iter().zip(bytes.chunks_exact_mut(8)) {
+        for (frame, slot) in block.iter().zip(bytes.as_chunks_mut::<8>().0) {
             slot[..4].copy_from_slice(&frame[0].to_le_bytes());
             slot[4..].copy_from_slice(&frame[1].to_le_bytes());
         }

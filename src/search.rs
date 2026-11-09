@@ -160,9 +160,11 @@ pub fn rank(
             continue;
         }
         let cosine = vector
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .zip(&embedding.vector)
-            .map(|(bytes, &target)| f32::from_le_bytes(bytes.try_into().unwrap()) * target)
+            .map(|(&bytes, &target)| f32::from_le_bytes(bytes) * target)
             .sum::<f32>();
         if !cosine.is_finite() {
             continue;

@@ -1,0 +1,33 @@
+name: Windows CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust and Clippy
+        run: rustup toolchain install stable --profile minimal --component clippy
+
+      - name: Build
+        run: cargo +stable build --locked
+
+      - name: Test
+        run: cargo +stable test --locked --all-targets
+
+      - name: Lint
+        run: cargo +stable clippy --locked --all-targets -- -D warnings

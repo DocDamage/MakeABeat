@@ -149,6 +149,16 @@ pub(super) struct RenderState {
     previous: Option<(Instant, usize)>,
 }
 
+pub(super) struct CallbackMeasurement {
+    pub started: Instant,
+    pub frames: usize,
+    pub rate: u32,
+    pub commands_elapsed: Duration,
+    pub mix_elapsed: Duration,
+    pub elapsed_ns: u64,
+    pub cycles_start: u64,
+}
+
 pub(super) fn thread_cycles() -> u64 {
     use windows::Win32::System::{
         Threading::GetCurrentThread, WindowsProgramming::QueryThreadCycleTime,
@@ -189,17 +199,16 @@ impl RenderState {
         mixed
     }
 
-    pub(super) fn callback(
-        &mut self,
-        probe: &RenderProbe,
-        start: Instant,
-        frames: usize,
-        rate: u32,
-        commands: Duration,
-        mixed: Duration,
-        elapsed_ns: u64,
-        cycles_start: u64,
-    ) {
+    pub(super) fn callback(&mut self, probe: &RenderProbe, measurement: CallbackMeasurement) {
+        let CallbackMeasurement {
+            started: start,
+            frames,
+            rate,
+            commands_elapsed: commands,
+            mix_elapsed: mixed,
+            elapsed_ns,
+            cycles_start,
+        } = measurement;
         let previous = self.previous.replace((start, frames));
         if previous.is_none() {
             probe

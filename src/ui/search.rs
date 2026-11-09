@@ -1,6 +1,6 @@
-use super::{App, DIM, TEXT, action, label, primary, small, time};
+use super::{App, DIM, TEXT, action, command_button, label, primary, small, time};
 use crate::{
-    app::search_workflow::UseHit,
+    app::{actions::Action, search_workflow::UseHit},
     library_index::{Kind, MAX_PASSAGES},
     model::MAX_NAMED_SAMPLES,
 };
@@ -170,8 +170,8 @@ fn index(app: &mut App, ui: &mut Ui) {
                 .desired_width(185.0)
                 .char_limit(60),
         );
-        if action(ui, "Add folder…", idle).clicked() {
-            app.index_search_folder();
+        if command_button(ui, app, Action::IndexFolder, "Add folder…").clicked() {
+            Action::IndexFolder.run(app);
         }
         if action(ui, "Index saved cuts", idle && !app.samples.is_empty()).clicked() {
             app.index_search_cuts();

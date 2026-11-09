@@ -1,5 +1,5 @@
 use super::{action, named_number, small};
-use crate::app::{App, Page, StudioView};
+use crate::app::{App, actions::Action};
 use eframe::egui::{self, Context, DragValue, ScrollArea};
 use serde::{Deserialize, Serialize};
 
@@ -50,21 +50,6 @@ impl Preferences {
     }
 }
 
-enum Command {
-    Open,
-    Save,
-    Import,
-    Undo,
-    Redo,
-    Preview,
-    Play,
-    Stop,
-    Dig,
-    Queue,
-    Crate,
-    Studio(StudioView),
-}
-
 pub fn show(app: &mut App, ctx: &Context) {
     let mut close = false;
     let mut run = None;
@@ -91,40 +76,27 @@ pub fn show(app: &mut App, ctx: &Context) {
         let submit_search = (search.has_focus() || search.lost_focus())
             && ui.input(|input| input.key_pressed(egui::Key::Enter));
         let query = app.command_query.trim().to_lowercase();
-        let busy = app.busy.is_some() || app.input_recording.is_some();
-        let items = [
-            ("Open project", "Ctrl+O", !busy, Command::Open),
-            ("Save project", "Ctrl+S", !busy, Command::Save),
-            ("Import audio", "Ctrl+I", !busy, Command::Import),
-            ("Undo project edit", "Ctrl+Z", app.can_undo_project(false), Command::Undo),
-            ("Redo project edit", "Ctrl+Shift+Z", app.can_undo_project(true), Command::Redo),
-            ("Preview source", "Space", app.clip.is_some(), Command::Preview),
-            ("Play or stop pattern", "Enter", app.output.is_some(), Command::Play),
-            ("Stop all playback", "", app.output.is_some(), Command::Stop),
-            ("Open Dig", "", true, Command::Dig),
-            ("Open Queue", "", true, Command::Queue),
-            ("Open Crate", "", true, Command::Crate),
-            ("Open waveform editor", "", true, Command::Studio(StudioView::Sample)),
-            ("Open performance controls", "", true, Command::Studio(StudioView::Perform)),
-            ("Open step sequencer", "", true, Command::Studio(StudioView::Sequence)),
-            ("Open song arrangement", "", true, Command::Studio(StudioView::Arrange)),
-            ("Open mixer", "", true, Command::Studio(StudioView::Mix)),
-        ];
         ScrollArea::vertical().max_height((ctx.screen_rect().height() * 0.46).min(230.0)).show(ui, |ui| {
             let mut first = true;
-            for (name, shortcut, enabled, command) in items {
-                if !format!("{name} {shortcut}").to_lowercase().contains(&query) {
-                    continue;
-                }
-                let pressed = ui.horizontal(|ui| {
-                    let clicked = action(ui, name, enabled).clicked();
+            let mut matched = false;
+            for &command in Action::PALETTE.iter().filter(|command| command.matches(&query)) {
+                matched = true;
+                let reason = command.unavailable(app);
+                let enabled = reason.is_none();
+                let shortcut = command.shortcut_text();
+                let pressed = ui.horizontal_wrapped(|ui| {
+                    let clicked = action(ui, command.title(), enabled).clicked();
                     if !shortcut.is_empty() { small(ui, shortcut); }
+                    if let Some(reason) = reason { small(ui, reason); }
                     clicked
                 }).inner;
                 if pressed || (first && enabled && submit_search) {
                     run = Some(command);
                 }
                 if enabled { first = false; }
+            }
+            if !matched {
+                small(ui, "No matching commands.");
             }
         });
         small(ui, "Tab moves focus, Enter or Space activates a control, and Escape clears focus. Ctrl+K opens these commands.");
@@ -136,30 +108,47 @@ pub fn show(app: &mut App, ctx: &Context) {
         app.persist_library();
     }
     if let Some(command) = run {
-        close = true;
-        match command {
-            Command::Open => app.open_dialog(),
-            Command::Save => app.save_dialog(),
-            Command::Import => app.import(),
-            Command::Undo => app.undo_project(false),
-            Command::Redo => app.undo_project(true),
-            Command::Preview => app.toggle_preview(),
-            Command::Play => app.toggle_pattern(),
-            Command::Stop => app.stop_all(),
-            Command::Dig => app.page = Page::Dig,
-            Command::Queue => app.page = Page::Queue,
-            Command::Crate => app.page = Page::Crate,
-            Command::Studio(view) => {
-                app.page = Page::Studio;
-                if view == StudioView::Arrange {
-                    app.open_arrangement();
-                } else {
-                    app.studio_view = view;
-                }
-            }
-        }
-    }
-    if close || modal.should_close() {
         app.show_commands = false;
+        command.run(app);
+    } else if close || modal.should_close() {
+        app.show_commands = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{app::{Page, StudioView}, ui::sample::Tool};
+
+    #[test]
+    fn palette_enter_runs_matching_tools_and_respects_disabled_actions() {
+        let ctx = Context::default();
+        let mut app = App::new(ctx.clone());
+        app.output = None;
+        let frame = |app: &mut App, events| {
+            let _ = ctx.run(egui::RawInput { events, ..Default::default() }, |ctx| show(app, ctx));
+        };
+        let enter = || egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        Action::Commands.run(&mut app);
+        app.command_query = "slice selection".into();
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![enter()]);
+        assert!(app.show_commands);
+        assert_eq!(app.sample_tool, None);
+
+        app.command_query = "sam audio".into();
+        app.focus_commands = true;
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![enter()]);
+        assert!(!app.show_commands);
+        assert_eq!(app.page, Page::Studio);
+        assert_eq!(app.studio_view, StudioView::Sample);
+        assert_eq!(app.sample_tool, Some(Tool::Extract));
     }
 }

@@ -101,8 +101,8 @@ impl App {
         let loaded = source.and_then(|i| self.source_arc(i)).or_else(|| {
             self.queue_audio
                 .as_ref()
-                .filter(|(source, _, _)| *source == record.source)
-                .map(|(_, clip, _)| clip.clone())
+                .filter(|audio| audio.source == record.source)
+                .map(|audio| audio.clip.clone())
         });
         let range = entry.match_range.or_else(|| {
             loaded.as_ref().and_then(|clip| {

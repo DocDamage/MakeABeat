@@ -143,8 +143,8 @@ impl Index {
                 if bytes.len() != DIMENSIONS * 4 {
                     continue;
                 }
-                for (value, bytes) in vector.iter_mut().zip(bytes.chunks_exact(4)) {
-                    *value += f32::from_le_bytes(bytes.try_into().unwrap()) * weight;
+                for (value, &bytes) in vector.iter_mut().zip(bytes.as_chunks::<4>().0) {
+                    *value += f32::from_le_bytes(bytes) * weight;
                 }
             }
             let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
