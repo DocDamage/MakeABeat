@@ -20,7 +20,7 @@ impl App {
     }
 
     pub fn select_groove(&mut self, index: usize) {
-        if let Some(template) = self.studio.grooves.get(index) {
+        if let Some(template) = self.project.studio.grooves.get(index) {
             self.groove_editor.draft = Some(template.clone());
             self.groove_editor.saved = Some(index);
         }
@@ -33,25 +33,25 @@ impl App {
         let index = self
             .groove_editor
             .saved
-            .filter(|&index| index < self.studio.grooves.len());
+            .filter(|&index| index < self.project.studio.grooves.len());
         if !template.validate()
-            || self.studio.grooves.iter().enumerate().any(|(i, saved)| {
+            || self.project.studio.grooves.iter().enumerate().any(|(i, saved)| {
                 Some(i) != index && saved.name.eq_ignore_ascii_case(&template.name)
             })
         {
             self.status = Some(("Give the groove a unique name.".into(), true));
             return;
         }
-        if index.is_none() && self.studio.grooves.len() >= MAX_TEMPLATES {
+        if index.is_none() && self.project.studio.grooves.len() >= MAX_TEMPLATES {
             self.status = Some(("The project groove library is full.".into(), true));
             return;
         }
         self.observe_edits(false);
         if let Some(index) = index {
-            self.studio.grooves[index] = template.clone();
+            self.project.studio.grooves[index] = template.clone();
         } else {
-            self.groove_editor.saved = Some(self.studio.grooves.len());
-            self.studio.grooves.push(template.clone());
+            self.groove_editor.saved = Some(self.project.studio.grooves.len());
+            self.project.studio.grooves.push(template.clone());
         }
         self.groove_editor.draft = Some(template);
         self.observe_edits(false);
@@ -113,7 +113,7 @@ impl App {
 
     fn groove_versions(&self) -> Option<(Sequence, Sequence)> {
         let template = self.groove_editor.draft.as_ref()?;
-        let before = self.studio.active_sequence();
+        let before = self.project.studio.active_sequence();
         let after = self.groove_editor.transfer.bake(before.clone(), template);
         Some((before, after))
     }
@@ -153,14 +153,14 @@ impl App {
         }
         self.stop_groove_preview();
         for (index, bar) in after.bars.into_iter().enumerate() {
-            self.studio.hits[index] = bar.drums;
-            self.studio.step_feel[index] = bar.feel;
+            self.project.studio.hits[index] = bar.drums;
+            self.project.studio.step_feel[index] = bar.feel;
         }
         let end = self
-            .studio
+            .project.studio
             .performance
-            .partition_point(|note| note.tick < self.studio.pattern_ticks());
-        self.studio.performance.splice(..end, after.performance);
+            .partition_point(|note| note.tick < self.project.studio.pattern_ticks());
+        self.project.studio.performance.splice(..end, after.performance);
         self.observe_edits(false);
         self.status = Some(("Applied groove to the working pattern.".into(), false));
     }
@@ -177,11 +177,11 @@ mod tests {
     #[test]
     fn baking_is_one_undo_and_preserves_hidden_bars() {
         let mut app = App::new(eframe::egui::Context::default());
-        app.studio.hits[0][0][1] = 1;
-        app.studio.hits[1][0][1] = 2;
-        app.studio.save_pattern("Working", false);
+        app.project.studio.hits[0][0][1] = 1;
+        app.project.studio.hits[1][0][1] = 2;
+        app.project.studio.save_pattern("Working", false);
         app.observe_edits(false);
-        app.session.reset(app.project_snapshot(), None, None);
+        app.session.reset(app.project.clone(), None, None);
         let before = app.session.current.clone();
         app.accept_groove(Template {
             name: "Timing test".into(),
@@ -200,8 +200,8 @@ mod tests {
             },
         });
         app.apply_groove();
-        assert_eq!(app.studio.step_feel[0][&(2 * STEPS as u8 + 1)].offset, 20);
-        assert_eq!(app.studio.bar_notes(1), before.studio.bar_notes(1));
+        assert_eq!(app.project.studio.step_feel[0][&(2 * STEPS as u8 + 1)].offset, 20);
+        assert_eq!(app.project.studio.bar_notes(1), before.studio.bar_notes(1));
         assert!(app.project_dirty());
         app.undo_project(false);
         assert!(app.session.current == before);

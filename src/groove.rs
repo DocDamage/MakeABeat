@@ -185,7 +185,7 @@ mod tests {
         let column = Cell::column(&bar.drums, bar.pads[1], bar.keys[1], bar.metadata(), 1);
         let drum = column[2]
             .unwrap()
-            .resolve(&studio, 2, 1, 0, false)
+            .resolve(studio.step_timing(), 2, 1, 0, false)
             .next()
             .unwrap();
         assert_eq!((drum.tick, drum.velocity), (129, 45));

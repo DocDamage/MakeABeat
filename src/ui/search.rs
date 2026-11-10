@@ -110,8 +110,8 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         small(ui, "No indexed passages yet. Check progress and indexing issues in Index and model setup.");
     }
     let pad = Some(app.selected_pad)
-        .filter(|&i| app.studio.pads[i].is_none())
-        .or_else(|| app.studio.pads.iter().position(Option::is_none));
+        .filter(|&i| app.project.studio.pads[i].is_none())
+        .or_else(|| app.project.studio.pads.iter().position(Option::is_none));
     let can_add = app.can_add_source() && !app.recording;
     let mut pending = None;
     for (index, hit) in app.search.results.iter().enumerate() {
@@ -145,7 +145,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                 }
             });
             ui.horizontal_wrapped(|ui| {
-                if action(ui, "Audition with beat", app.output.is_some()).clicked() {
+                if action(ui, "Audition with beat", app.audio.output().is_some()).clicked() {
                     pending = Some((hit.clone(), UseHit::Audition));
                 }
                 if let Some(pad) = pad
@@ -156,7 +156,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                 if action(
                     ui,
                     "Save cut",
-                    can_add && app.samples.len() < MAX_NAMED_SAMPLES,
+                    can_add && app.project.samples.len() < MAX_NAMED_SAMPLES,
                 )
                 .clicked()
                 {
@@ -197,7 +197,7 @@ fn index(app: &mut App, ui: &mut Ui) {
         if command_button(ui, app, Action::IndexFolder, "Add folder…").clicked() {
             Action::IndexFolder.run(app);
         }
-        if action(ui, "Index saved cuts", idle && !app.samples.is_empty()).clicked() {
+        if action(ui, "Index saved cuts", idle && !app.project.samples.is_empty()).clicked() {
             app.index_search_cuts();
         }
         if action(ui, "Index cached downloads", idle).clicked() {

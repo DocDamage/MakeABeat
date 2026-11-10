@@ -13,10 +13,10 @@ pub fn panel(app: &mut App, ui: &mut Ui, sample_view: bool) {
                 app.import_groove();
             }
             ComboBox::from_id_salt("groove_library").selected_text(
-                app.groove_editor.saved.and_then(|i| app.studio.grooves.get(i))
+                app.groove_editor.saved.and_then(|i| app.project.studio.grooves.get(i))
                     .map_or("Saved grooves", |groove| groove.name.as_str()),
             ).show_ui(ui, |ui| {
-                for (i, groove) in app.studio.grooves.iter().enumerate() {
+                for (i, groove) in app.project.studio.grooves.iter().enumerate() {
                     if ui.selectable_label(app.groove_editor.saved == Some(i), &groove.name).clicked() {
                         selected = Some(i);
                     }
@@ -68,12 +68,12 @@ pub fn panel(app: &mut App, ui: &mut Ui, sample_view: bool) {
                 ui.checkbox(selected, grid_edit::lane_name(row));
             }
         });
-        let can_listen = app.can_play_section() && app.studio.has_pattern();
+        let can_listen = app.can_play_section() && app.project.studio.has_pattern();
         ui.horizontal_wrapped(|ui| {
             if action(ui, "Play before", can_listen).clicked() { app.preview_groove(false); }
             if action(ui, "Play after", can_listen).clicked() { app.preview_groove(true); }
             if app.groove_preview_playing() && action(ui, "Stop comparison", true).clicked() { app.stop_groove_preview(); }
-            if action(ui, "Apply groove", !app.recording && app.studio.has_pattern()).clicked() { app.apply_groove(); }
+            if action(ui, "Apply groove", !app.recording && app.project.studio.has_pattern()).clicked() { app.apply_groove(); }
         });
     };
     controls(ui);
@@ -93,7 +93,7 @@ pub fn audition(app: &mut App, ui: &mut Ui) {
         .prepared
         .as_ref()
         .is_some_and(|p| p.fitted.is_some());
-    let can_play = app.output.is_some() && !app.recording;
+    let can_play = app.audio.output().is_some() && !app.recording;
     ui.horizontal_wrapped(|ui| {
         ui.label(label("AUDITION WITH BEAT", 12.0, DIM).strong());
         small(ui, &preview.title);
@@ -135,8 +135,7 @@ pub fn audition(app: &mut App, ui: &mut Ui) {
         stop = action(ui, "Close audition", true).clicked();
     });
     let transport = app
-        .output
-        .as_ref()
+        .audio.output()
         .map_or(0, |output| output.meters.beat_audition());
     let state = if preview.preparing {
         "Preparing audio…"

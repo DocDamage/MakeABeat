@@ -45,7 +45,7 @@ impl Dialog {
     }
 
     pub fn show(&mut self, app: &mut App, ctx: &Context) -> bool {
-        if app.recording || app.studio.active_sequence() != self.base {
+        if app.recording || app.project.studio.active_sequence() != self.base {
             self.stop(app);
             return false;
         }

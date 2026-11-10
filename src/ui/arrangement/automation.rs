@@ -413,7 +413,7 @@ impl Editor {
         let scope = Scope::Section(index);
         let range = scope.range(studio);
         let song = studio.automation.points(self.target).to_vec();
-        let baseline = self.target.baseline(studio);
+        let baseline = self.target.baseline(studio.sample_level, studio.drum_level);
         let at = |tick| {
             (100.0 * Automation::interpolate(&song, f64::from(tick), baseline)).round() as u8
         };
@@ -621,7 +621,7 @@ impl Editor {
             .map_or(scope.automation(studio).points(self.target), |stroke| {
                 &stroke.points
             });
-        let baseline = self.target.baseline(studio);
+        let baseline = self.target.baseline(studio.sample_level, studio.drum_level);
         let (display, offset) = if points.is_empty() && matches!(scope, Scope::Section(_)) {
             (studio.automation.points(self.target), range.start)
         } else {
@@ -742,13 +742,13 @@ mod tests {
             .unwrap();
         assert!((hook.value(volume, tick, 1.0) - 0.25).abs() < 1e-6);
         let mut app = crate::app::App::new(egui::Context::default());
-        app.studio = before.clone();
+        app.project.studio = before.clone();
         app.observe_edits(false);
-        let before = app.studio.clone();
-        app.studio = studio;
+        let before = app.project.studio.clone();
+        app.project.studio = studio;
         app.observe_edits(false);
         app.undo_project(false);
-        assert_eq!(app.studio, before);
+        assert_eq!(app.project.studio, before);
     }
 
     #[test]

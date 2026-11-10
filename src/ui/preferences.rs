@@ -1,7 +1,6 @@
 use super::{action, named_number, small};
-use crate::app::{App, actions::Action};
+use crate::{app::{App, actions::Action}, model::preferences::Preferences};
 use eframe::egui::{self, Context, DragValue, ScrollArea};
-use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy)]
 pub(super) struct ControlColors {
@@ -12,72 +11,44 @@ pub(super) struct ControlColors {
     pub emphasis: f32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Preferences {
-    pub zoom: f32,
-    pub high_contrast: bool,
-    pub reduce_motion: bool,
-    pub show_pads: bool,
-    pub stereo_waveform: bool,
-    pub crate_sort: usize,
-    pub pads_width: f32,
-}
-
-impl Default for Preferences {
-    fn default() -> Self {
-        Self {
-            zoom: 1.0,
-            high_contrast: false,
-            reduce_motion: false,
-            show_pads: true,
-            stereo_waveform: false,
-            crate_sort: 0,
-            pads_width: 410.0,
+pub(super) fn control_colors(preferences: Preferences) -> ControlColors {
+    if preferences.high_contrast {
+        ControlColors {
+            edge: egui::Color32::from_gray(133),
+            secondary_text: egui::Color32::from_gray(221),
+            accent: super::MINT,
+            focus: egui::Color32::WHITE,
+            emphasis: 2.0,
+        }
+    } else {
+        ControlColors {
+            edge: super::EDGE,
+            secondary_text: super::DIM,
+            accent: super::GREEN,
+            focus: super::TEXT,
+            emphasis: 1.0,
         }
     }
 }
 
-impl Preferences {
-    pub(super) fn control_colors(self) -> ControlColors {
-        if self.high_contrast {
-            ControlColors {
-                edge: egui::Color32::from_gray(133),
-                secondary_text: egui::Color32::from_gray(221),
-                accent: super::MINT,
-                focus: egui::Color32::WHITE,
-                emphasis: 2.0,
-            }
-        } else {
-            ControlColors {
-                edge: super::EDGE,
-                secondary_text: super::DIM,
-                accent: super::GREEN,
-                focus: super::TEXT,
-                emphasis: 1.0,
-            }
+pub(crate) fn apply(preferences: Preferences, ctx: &Context) {
+    ctx.set_zoom_factor(if preferences.zoom.is_finite() {
+        preferences.zoom.clamp(0.8, 1.45)
+    } else {
+        1.0
+    });
+    super::style(ctx);
+    ctx.style_mut(|style| {
+        if preferences.high_contrast {
+            let colors = control_colors(preferences);
+            style.visuals.widgets.inactive.bg_stroke.color = colors.edge;
+            style.visuals.widgets.hovered.bg_stroke.color = colors.focus;
+            style.visuals.selection.stroke = egui::Stroke::new(colors.emphasis, colors.accent);
         }
-    }
-
-    pub fn apply(self, ctx: &Context) {
-        ctx.set_zoom_factor(if self.zoom.is_finite() {
-            self.zoom.clamp(0.8, 1.45)
-        } else {
-            1.0
-        });
-        super::style(ctx);
-        ctx.style_mut(|style| {
-            if self.high_contrast {
-                let colors = self.control_colors();
-                style.visuals.widgets.inactive.bg_stroke.color = colors.edge;
-                style.visuals.widgets.hovered.bg_stroke.color = colors.focus;
-                style.visuals.selection.stroke = egui::Stroke::new(colors.emphasis, colors.accent);
-            }
-            if self.reduce_motion {
-                style.animation_time = 0.0;
-            }
-        });
-    }
+        if preferences.reduce_motion {
+            style.animation_time = 0.0;
+        }
+    });
 }
 
 pub fn show(app: &mut App, ctx: &Context) {
@@ -98,14 +69,14 @@ pub fn show(app: &mut App, ctx: &Context) {
             ui.checkbox(&mut app.library.interface.reduce_motion, "Reduce motion");
             ui.checkbox(&mut app.library.interface.show_pads, "Show pads beside waveform");
         });
-        let search = ui.add(egui::TextEdit::singleline(&mut app.command_query).hint_text("Find a command or shortcut"));
-        if app.focus_commands {
+        let search = ui.add(egui::TextEdit::singleline(&mut app.view.commands.query).hint_text("Find a command or shortcut"));
+        if app.view.commands.focus {
             search.request_focus();
-            app.focus_commands = false;
+            app.view.commands.focus = false;
         }
         let submit_search = (search.has_focus() || search.lost_focus())
             && ui.input(|input| input.key_pressed(egui::Key::Enter));
-        let query = app.command_query.trim().to_lowercase();
+        let query = app.view.commands.query.trim().to_lowercase();
         ScrollArea::vertical().max_height((ctx.screen_rect().height() * 0.46).min(230.0)).show(ui, |ui| {
             let mut first = true;
             let mut matched = false;
@@ -134,14 +105,14 @@ pub fn show(app: &mut App, ctx: &Context) {
         small(ui, "Waveform: Z and C set boundaries, X toggles looping. Pad mode uses Z, X and C to play pads.");
     });
     if app.library.interface != initial {
-        app.library.interface.apply(ctx);
+        apply(app.library.interface, ctx);
         app.persist_library();
     }
     if let Some(command) = run {
-        app.show_commands = false;
+        app.view.commands.open = false;
         command.run(app);
     } else if close || modal.should_close() {
-        app.show_commands = false;
+        app.view.commands.open = false;
     }
 }
 
@@ -154,7 +125,7 @@ mod tests {
     fn palette_enter_runs_matching_tools_and_respects_disabled_actions() {
         let ctx = Context::default();
         let mut app = App::new(ctx.clone());
-        app.output = None;
+        app.audio.remove_output();
         let frame = |app: &mut App, events| {
             let _ = ctx.run(egui::RawInput { events, ..Default::default() }, |ctx| show(app, ctx));
         };
@@ -166,19 +137,19 @@ mod tests {
             modifiers: egui::Modifiers::NONE,
         };
         Action::Commands.run(&mut app);
-        app.command_query = "slice selection".into();
+        app.view.commands.query = "slice selection".into();
         frame(&mut app, vec![]);
         frame(&mut app, vec![enter()]);
-        assert!(app.show_commands);
-        assert_eq!(app.sample_tool, None);
+        assert!(app.view.commands.open);
+        assert_eq!(app.view.sample_tool, None);
 
-        app.command_query = "sam audio".into();
-        app.focus_commands = true;
+        app.view.commands.query = "sam audio".into();
+        app.view.commands.focus = true;
         frame(&mut app, vec![]);
         frame(&mut app, vec![enter()]);
-        assert!(!app.show_commands);
-        assert_eq!(app.page, Page::Studio);
-        assert_eq!(app.studio_view, StudioView::Sample);
-        assert_eq!(app.sample_tool, Some(Tool::Extract));
+        assert!(!app.view.commands.open);
+        assert_eq!(app.view.page, Page::Studio);
+        assert_eq!(app.view.studio_view, StudioView::Sample);
+        assert_eq!(app.view.sample_tool, Some(Tool::Extract));
     }
 }

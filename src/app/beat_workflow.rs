@@ -49,7 +49,7 @@ impl App {
     fn analysis_scope(&self, clip: &Clip) -> Scope {
         Scope {
             revision: self.analysis.revision,
-            source: self.active_source,
+            source: self.media.active_source(),
             selection: self.selection(),
             frames: clip.frames.clone(),
         }
@@ -57,7 +57,7 @@ impl App {
 
     fn scope_is_current(&self, scope: &Scope) -> bool {
         self.analysis.revision == scope.revision
-            && self.active_source == scope.source
+            && self.media.active_source() == scope.source
             && self.selection() == scope.selection
             && self
                 .active_clip()
@@ -200,7 +200,7 @@ impl App {
             Model::Pulse
         };
         self.observe_edits(false);
-        let Some(clip) = self.source_arc(self.active_source) else {
+        let Some(clip) = self.source_arc(self.media.active_source()) else {
             return;
         };
         let scope = self.analysis_scope(&clip);
@@ -209,9 +209,9 @@ impl App {
         let key = JobKey {
             job_id: self.analysis.next_id,
             project_revision: scope.revision,
-            source_id: self.source_ids.get(scope.source).copied(),
+            source_id: self.project.source_ids.get(scope.source).copied(),
         };
-        let bpm = self.studio.bpm;
+        let bpm = self.project.studio.bpm;
         self.analysis.proposal = None;
         self.queue_analysis(
             "Analyzing beats locally…",
@@ -242,19 +242,19 @@ impl App {
             return;
         }
         let mut map = self
-            .studio
+            .project.studio
             .beat_maps
             .get(&scope.source)
             .map_or_else(BeatMap::default, |map| map.as_ref().clone());
         map.adopt(&proposal.beats, proposal.provenance, self.duration());
-        self.studio.beat_maps.insert(scope.source, Arc::new(map));
+        self.project.studio.beat_maps.insert(scope.source, Arc::new(map));
         self.observe_edits(false);
     }
 
     pub fn extract_groove(&mut self) {
-        let Some(clip) = self.source_arc(self.active_source) else { return };
+        let Some(clip) = self.source_arc(self.media.active_source()) else { return };
         let Some(range) = self.selection() else { return };
-        let Some(beats) = self.studio.beat_maps.get(&self.active_source).and_then(|map| {
+        let Some(beats) = self.project.studio.beat_maps.get(&self.media.active_source()).and_then(|map| {
             crate::groove::loop_beats(map, range, crate::model::groove::MAX_BARS)
         }) else {
             self.status = Some(("Select a complete bar from its downbeat through the next downbeat in the beat map.".into(), true));
@@ -262,7 +262,7 @@ impl App {
         };
         let scope = self.analysis_scope(&clip);
         let beats = beats.to_vec();
-        let title = self.source_record(self.active_source).map_or_else(|| "Audio selection".into(), |r| r.title.clone());
+        let title = self.source_record(self.media.active_source()).map_or_else(|| "Audio selection".into(), |r| r.title.clone());
         self.queue_analysis("Extracting groove", Priority::Interactive, move || {
             Ok(Completion::Groove(scope.clone(), crate::groove::extract(&clip, &beats, title.clone())
                 .map_err(|error| error.to_string())))
@@ -271,10 +271,10 @@ impl App {
 
     pub fn prepare_mapped_warp(&mut self) {
         let range = self.selection().unwrap_or((0.0, self.duration()));
-        let Some(map) = self.studio.beat_maps.get(&self.active_source) else {
+        let Some(map) = self.project.studio.beat_maps.get(&self.media.active_source()) else {
             return;
         };
-        match map.warp_plan(range, self.studio.bpm) {
+        match map.warp_plan(range, self.project.studio.bpm) {
             Ok(plan) => self.prepare_warp(plan),
             Err(error) => self.status = Some((error.to_string(), true)),
         }
@@ -297,9 +297,9 @@ impl App {
             return;
         };
         let markers = if use_markers {
-            self.studio
+            self.project.studio
                 .warp_markers
-                .get(&self.active_source)
+                .get(&self.media.active_source())
                 .into_iter()
                 .flatten()
                 .copied()
@@ -320,11 +320,11 @@ impl App {
             return;
         }
         self.observe_edits(false);
-        let Some(clip) = self.source_arc(self.active_source) else {
+        let Some(clip) = self.source_arc(self.media.active_source()) else {
             return;
         };
         let scope = self.analysis_scope(&clip);
-        let bpm = self.studio.bpm;
+        let bpm = self.project.studio.bpm;
         let remaining = files::MAX_PROJECT_FRAMES
             .saturating_sub(self.project_frame_count())
             .min(files::MAX_PROJECT_FRAMES / 2);
@@ -370,7 +370,7 @@ impl App {
     }
 
     pub fn audition_warp(&mut self, processed: bool) {
-        if self.output.is_none() || self.recording {
+        if self.audio.output().is_none() || self.recording {
             return;
         }
         let Some(preview) = self.warp_preview() else {
@@ -379,7 +379,7 @@ impl App {
         let audio = if processed {
             Some((preview.clip.clone(), (0.0, preview.clip.duration())))
         } else {
-            self.source_arc(self.active_source)
+            self.source_arc(self.media.active_source())
                 .map(|clip| (clip, preview.plan.range))
         };
         if let Some((clip, range)) = audio {
@@ -401,9 +401,9 @@ impl App {
             return;
         };
         let plan = preview.plan.clone();
-        self.studio
+        self.project.studio
             .warp_markers
-            .insert(self.active_source, plan.markers);
+            .insert(self.media.active_source(), plan.markers);
         self.set_loop_range(plan.range);
         self.observe_edits(false);
     }
@@ -441,13 +441,13 @@ impl App {
             release: None,
         };
         self.discard_warp_preview();
-        let target = self.studio.sources.len() + 1;
+        let target = self.project.studio.sources.len() + 1;
         self.apply_job(Job::SourceAdded(
             record,
             preview.clip.as_ref().clone(),
             None,
         ));
-        self.studio.warp_sources.insert(
+        self.project.studio.warp_sources.insert(
             target,
             WarpSource {
                 parent: scope.source,
@@ -483,9 +483,9 @@ mod tests {
     fn a_cancelled_or_stale_warp_attaches_nothing_and_keep_uses_the_preview_buffer()
     -> files::Result<()> {
         let mut app = App::new(egui::Context::default());
-        app.output = None;
+        app.audio.remove_output();
         let rate = 8_000;
-        app.clip = Some(Arc::new(Clip::new(
+        app.media.replace(Some(Arc::new(Clip::new(
             rate,
             (0..3 * rate)
                 .map(|frame| {
@@ -494,52 +494,52 @@ mod tests {
                     [sample; 2]
                 })
                 .collect(),
-        )));
-        app.studio.bpm = 120;
+        ))));
+        app.project.studio.bpm = 120;
         let mut map = BeatMap::default();
         for at in [0.1, 0.59, 1.1, 1.64, 2.22] {
             map.add(at, 3.0).unwrap();
         }
         map.set_downbeat(0);
-        app.studio.beat_maps.insert(0, Arc::new(map));
+        app.project.studio.beat_maps.insert(0, Arc::new(map));
         app.set_loop_range((0.0, 2.5));
         app.observe_edits(false);
-        let original = app.project_snapshot();
+        let original = app.project.clone();
         app.prepare_mapped_warp();
         app.cancel_analysis();
         finish(&mut app);
         assert!(app.warp_preview().is_none());
-        assert!(app.project_snapshot() == original);
+        assert!(app.project.clone() == original);
 
         app.prepare_mapped_warp();
         app.set_loop_range((0.05, 2.3));
         app.observe_edits(false);
         finish(&mut app);
         assert!(app.warp_preview().is_none());
-        assert!(app.studio.sources.is_empty());
+        assert!(app.project.studio.sources.is_empty());
 
-        let before_keep = app.project_snapshot();
+        let before_keep = app.project.clone();
         app.prepare_mapped_warp();
         finish(&mut app);
         let preview = app.warp_preview().expect("a prepared preview");
         let frames = preview.clip.frames.clone();
         assert_eq!(frames.len(), 16_000);
-        assert!(app.project_snapshot() == before_keep);
+        assert!(app.project.clone() == before_keep);
         app.keep_warp_preview();
         let committed = app.source_arc(1).expect("new project source");
         assert!(Arc::ptr_eq(&committed.frames, &frames));
-        assert_eq!(app.studio.warp_sources[&1].parent, 0);
+        assert_eq!(app.project.studio.warp_sources[&1].parent, 0);
 
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("warped.flip");
-        let project = app.project_snapshot();
-        files::save_project(&path, &project, app.clip.as_deref())?;
+        let project = app.project.clone();
+        files::save_project(&path, &project, app.media.root_clip())?;
         assert_eq!(&std::fs::read(&path)?[..8], b"LSFLIP06");
         let (reopened, clip) = files::open_project(&path)?;
         assert!(reopened == project);
         assert_eq!(clip.unwrap().sources[0].frames, frames);
         app.undo_project(false);
-        assert!(app.project_snapshot() == before_keep);
+        assert!(app.project.clone() == before_keep);
         Ok(())
     }
 }

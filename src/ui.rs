@@ -1,5 +1,5 @@
 use crate::{
-    app::{App, Page, Pool, StudioView, actions::Action},
+    app::{App, Page, Pool, StudioView, actions::Action, pad_workflow::Edit as PadEdit},
     audio::{Command, PadMode},
     midi::{Route, Target},
     model::{
@@ -210,8 +210,8 @@ fn panel() -> Frame {
 }
 
 pub fn draw(app: &mut App, ctx: &Context) {
-    if app.page != Page::Studio || app.studio_view != StudioView::Sequence {
-        app.sequence_tool = None;
+    if app.view.page != Page::Studio || app.view.studio_view != StudioView::Sequence {
+        app.view.sequence_tool = None;
     }
     let had_import_dialog = app.youtube_url.is_some();
     egui::TopBottomPanel::top("navigation")
@@ -224,14 +224,14 @@ pub fn draw(app: &mut App, ctx: &Context) {
                 ui.separator();
                 groove::audition(app, ui);
             }
-            if app.page == Page::Studio {
+            if app.view.page == Page::Studio {
                 ui.separator();
                 studio_header(app, ui);
             }
         });
     if app.busy.is_some()
         || app.status.is_some()
-        || app.audio_error.is_some()
+        || app.audio.error().is_some()
         || app.analysis_job().is_some()
         || app.library_recovery.is_some()
         || app.crate_save_error().is_some()
@@ -243,13 +243,13 @@ pub fn draw(app: &mut App, ctx: &Context) {
     egui::CentralPanel::default()
         .frame(Frame::new().fill(BG).inner_margin(Margin::symmetric(14, 8)))
         .show(ctx, |ui| {
-            if app.page == Page::Studio {
+            if app.view.page == Page::Studio {
                 studio(app, ui);
                 return;
             }
             if !app.library.interface.reduce_motion && !app.library.interface.high_contrast { backdrop(ui); }
             ScrollArea::vertical()
-                .id_salt(match app.page {
+                .id_salt(match app.view.page {
                     Page::Dig => "dig",
                     Page::Queue => "queue",
                     Page::Search => "search",
@@ -257,7 +257,7 @@ pub fn draw(app: &mut App, ctx: &Context) {
                     Page::Studio => unreachable!(),
                 })
                 .auto_shrink([false, false])
-                .show(ui, |ui| match app.page {
+                .show(ui, |ui| match app.view.page {
                     Page::Dig => dig(app, ui),
                     Page::Queue => queue(app, ui),
                     Page::Search => search::show(app, ui),
@@ -269,7 +269,7 @@ pub fn draw(app: &mut App, ctx: &Context) {
                     Page::Studio => unreachable!(),
                 });
         });
-    if app.show_commands {
+    if app.view.commands.open {
         preferences::show(app, ctx);
     } else if app.youtube_url.is_some() {
         youtube_dialog(app, ctx, !had_import_dialog);
@@ -299,11 +299,11 @@ pub fn draw(app: &mut App, ctx: &Context) {
         } else {
             app.transcription.editor = Some(editor);
         }
-    } else if let Some(mut roll) = app.piano_roll.take()
+    } else if let Some(mut roll) = app.view.piano_roll.take()
         && !roll.show(app, ctx)
     {
-        app.piano_roll = Some(roll);
-    } else if app.page == Page::Studio && app.studio_view == StudioView::Sequence {
+        app.view.piano_roll = Some(roll);
+    } else if app.view.page == Page::Studio && app.view.studio_view == StudioView::Sequence {
         sequencer::dialog(app, ctx);
     }
 }
@@ -541,7 +541,7 @@ fn midi_dialog(app: &mut App, ctx: &Context) {
 fn daw_dialog(app: &mut App, ctx: &Context) {
     let ready = app.busy.is_none();
     let mut close = false;
-    let has_melody = app.studio.uses_transcription();
+    let has_melody = app.project.studio.uses_transcription();
     let modal = responsive_modal(ctx, "daw_export", 510.0, |ui| {
         ui.label(label("Export DAW pack", 21.0, TEXT).strong());
         ui.add_enabled_ui(ready, |ui| ui.collapsing("Pack contents", |ui| {
@@ -786,7 +786,7 @@ fn header(app: &mut App, ui: &mut Ui) {
             (Page::Search, "Search"),
             (Page::Crate, "Crate"),
         ] {
-            if pill(ui, title, app.page == page).clicked() {
+            if pill(ui, title, app.view.page == page).clicked() {
                 Action::Page(page).run(app);
             }
         }
@@ -922,7 +922,7 @@ fn notice(app: &mut App, ui: &mut Ui) {
             }
         });
     }
-    if let Some(error) = &app.audio_error {
+    if let Some(error) = app.audio.error() {
         let message = format!("Audio output unavailable: {error}");
         ui.horizontal_wrapped(|ui| {
             ui.label(label(message, 12.0, GOLD));
@@ -950,10 +950,10 @@ fn dig(app: &mut App, ui: &mut Ui) {
         if app.pool == Pool::Local && action(ui, "Choose folder…", app.busy.is_none()).clicked() {
             app.pick_folder();
         }
-        if app.record.is_none() && action(ui, "Try an offline demo", app.busy.is_none()).clicked() {
+        if app.project.record.is_none() && action(ui, "Try an offline demo", app.busy.is_none()).clicked() {
             app.pool = Pool::Demo;
             app.genres.fill(false);
-            app.page = Page::Studio;
+            app.view.page = Page::Studio;
             app.dig();
         }
         ui.checkbox(&mut app.unheard_only, "Unheard only");
@@ -1088,7 +1088,7 @@ fn dig(app: &mut App, ui: &mut Ui) {
         hero(app, ui);
         ui.add_space(6.0);
         transport(app, ui);
-        if app.record.is_some() {
+        if app.project.record.is_some() {
             ui.add_space(4.0);
             record_details(app, ui);
         }
@@ -1237,13 +1237,13 @@ fn queue(app: &mut App, ui: &mut Ui) {
                     if action(
                         ui,
                         if playing { "Stop" } else { "Preview" },
-                        ready && app.output.is_some(),
+                        ready && app.audio.output().is_some(),
                     )
                     .clicked()
                     {
                         choice = Some((index, "preview"));
                     }
-                    if action(ui, "Audition with beat", ready && app.output.is_some()).clicked() {
+                    if action(ui, "Audition with beat", ready && app.audio.output().is_some()).clicked() {
                         choice = Some((index, "beat"));
                     }
                     if primary(ui, "Open in Studio", ready).clicked() {
@@ -1347,7 +1347,7 @@ fn hero(app: &mut App, ui: &mut Ui) {
         StrokeKind::Inside,
     );
     let center = rect.center();
-    if let Some(record) = &app.record {
+    if let Some(record) = &app.project.record {
         let tint = if matches!(
             record.source,
             Source::Commons { .. } | Source::YouTube { .. }
@@ -1506,7 +1506,7 @@ fn transport(app: &mut App, ui: &mut Ui) {
         if primary(ui, "Dig   D", ready).clicked() {
             app.dig();
         }
-        if action(ui, "Jump   F", app.clip.is_some()).clicked() {
+        if action(ui, "Jump   F", app.media.root().is_some()).clicked() {
             app.jump();
         }
         if action(ui, "Next →   P", ready).clicked() {
@@ -1520,7 +1520,7 @@ fn transport(app: &mut App, ui: &mut Ui) {
             };
             if ui
                 .add_enabled(
-                    app.record.is_some(),
+                    app.project.record.is_some(),
                     Button::new(label(text, 13.0, GOLD))
                         .fill(Color32::from_rgb(41, 32, 17))
                         .stroke(Stroke::new(1.0_f32, Color32::from_rgb(93, 70, 29))),
@@ -1641,7 +1641,7 @@ fn record_row(ui: &mut Ui, title: &str, subtitle: &str, active: bool, enabled: b
 }
 
 fn record_details(app: &mut App, ui: &mut Ui) {
-    if let Some(record) = &app.record {
+    if let Some(record) = &app.project.record {
         ui.add(Label::new(label(&record.title, 19.0, TEXT).strong()).wrap());
         ui.horizontal_wrapped(|ui| {
             small(ui, format!("{}  ·  {}", record.artist, record.genre));
@@ -1670,14 +1670,14 @@ fn record_details(app: &mut App, ui: &mut Ui) {
             (1.5, "1.5×"),
             (2.0, "2×"),
         ] {
-            if pill(ui, name, app.studio.speed == speed).clicked() {
-                app.studio.speed = speed;
+            if pill(ui, name, app.project.studio.speed == speed).clicked() {
+                app.project.studio.speed = speed;
             }
         }
         if action(ui, "Tap   B", true).clicked() {
             app.tap();
         }
-        small(ui, format!("{} BPM", app.studio.bpm));
+        small(ui, format!("{} BPM", app.project.studio.bpm));
     });
     ui.add_space(4.0);
     if ui
@@ -1689,7 +1689,7 @@ fn record_details(app: &mut App, ui: &mut Ui) {
         )
         .clicked()
     {
-        app.page = Page::Studio;
+        app.view.page = Page::Studio;
     }
     small(
         ui,
@@ -1842,7 +1842,7 @@ fn crate_panel(app: &mut App, ui: &mut Ui) {
                     let subtitle = format!("{} · {} BPM{}{}", saved.record.artist, saved.studio.bpm,
                         if saved.tags.is_empty() { "" } else { " · " }, saved.tags);
                     if record_row(ui, &saved.record.title, &subtitle,
-                        app.record.as_ref() == Some(&saved.record), ready && !missing).clicked()
+                        app.project.record.as_ref() == Some(&saved.record), ready && !missing).clicked()
                     {
                         load = Some(saved.clone());
                     }
@@ -1888,8 +1888,8 @@ fn crate_panel(app: &mut App, ui: &mut Ui) {
             app.persist_library();
         }
         if let Some(saved) = load {
-            if app.page == Page::Crate {
-                app.page = Page::Dig;
+            if app.view.page == Page::Crate {
+                app.view.page = Page::Dig;
             }
             app.load(saved.record, Some(saved.studio), None);
         }
@@ -1918,11 +1918,11 @@ fn studio_transport(app: &mut App, ui: &mut Ui) {
                 app.finish_input();
             }
         }
-        if app.page == Page::Studio && ui.checkbox(&mut app.fill, "Fill").on_hover_text("Activate fill-only sequencer steps during playback").changed() {
+        if app.view.page == Page::Studio && ui.checkbox(&mut app.fill, "Fill").on_hover_text("Activate fill-only sequencer steps during playback").changed() {
             app.send(crate::audio::Command::Fill(app.fill));
         }
         if app.recording {
-            let beats = app.output.as_ref().map_or(0, |output| output.meters.count_in_beats());
+            let beats = app.audio.output().map_or(0, |output| output.meters.count_in_beats());
             let status = if beats > 0 { format!("Count-in · {beats}") }
                 else if app.playing { "Recording".into() } else { "Armed · waiting for MIDI clock".into() };
             ui.label(label(status, 13.0, GOLD));
@@ -1930,7 +1930,7 @@ fn studio_transport(app: &mut App, ui: &mut Ui) {
         if let Some(step) = app.step {
             small(ui, format!("Bar {} · Beat {}", step / STEPS + 1, step % STEPS / 4 + 1));
         }
-        if let Some(output) = &app.output && app.page == Page::Studio {
+        if let Some(output) = app.audio.output() && app.view.page == Page::Studio {
             let peak = output.meters.peak();
             ui.add(egui::ProgressBar::new(peak.min(1.0)).desired_width(84.0)
                 .fill(if peak >= 1.0 { GOLD } else { GREEN }))
@@ -1939,7 +1939,7 @@ fn studio_transport(app: &mut App, ui: &mut Ui) {
                 ui.label(label("Peak", 11.0, GOLD));
             }
         }
-        if app.keyboard && app.page == Page::Studio {
+        if app.keyboard && app.view.page == Page::Studio {
             ui.label(label("Computer keyboard playing", 12.0, GOLD));
         }
     });
@@ -1956,7 +1956,7 @@ fn studio_header(app: &mut App, ui: &mut Ui) {
             (StudioView::Arrange, "Arrange"),
             (StudioView::Mix, "Mix"),
         ] {
-            if pill(ui, title, app.studio_view == view).clicked() {
+            if pill(ui, title, app.view.studio_view == view).clicked() {
                 Action::Studio(view).run(app);
             }
         }
@@ -1972,7 +1972,7 @@ fn studio_header(app: &mut App, ui: &mut Ui) {
 }
 
 fn studio(app: &mut App, ui: &mut Ui) {
-    let view = app.studio_view;
+    let view = app.view.studio_view;
     if view == StudioView::Sequence {
         sequencer::show(app, ui);
         return;
@@ -2033,7 +2033,7 @@ fn performance_panel(app: &mut App, ui: &mut Ui) {
 }
 
 fn retrospective_capture(app: &mut App, ui: &mut Ui) {
-    let Some(output) = &app.output else { return };
+    let Some(output) = app.audio.output() else { return };
     let available = output.performance.has_notes();
     let bars = output.performance.bars();
     let overflowed = output.performance.overflowed();
@@ -2060,7 +2060,7 @@ fn retrospective_capture(app: &mut App, ui: &mut Ui) {
     if let Some(bars) = request {
         app.preview_performance(bars);
     }
-    let Some(preview) = app.output.as_ref().and_then(|output| output.performance.preview())
+    let Some(preview) = app.audio.output().and_then(|output| output.performance.preview())
     else { return };
     let mut keep = false;
     let mut dismiss = false;
@@ -2087,7 +2087,7 @@ fn retrospective_capture(app: &mut App, ui: &mut Ui) {
         };
         small(ui, notice);
     }
-    let notes = preview.notes(app.capture_quantize, app.studio.swing);
+    let notes = preview.notes(app.capture_quantize, app.project.studio.swing);
     let width = ui.available_width().clamp(40.0, 480.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 20.0), egui::Sense::hover());
     let painter = ui.painter_at(rect);
@@ -2109,7 +2109,7 @@ fn retrospective_capture(app: &mut App, ui: &mut Ui) {
     }
     if keep {
         app.keep_performance();
-    } else if dismiss && let Some(output) = &app.output {
+    } else if dismiss && let Some(output) = app.audio.output() {
         output.performance.invalidate_preview();
     }
 }
@@ -2117,7 +2117,7 @@ fn retrospective_capture(app: &mut App, ui: &mut Ui) {
 fn loop_panel(app: &mut App, ui: &mut Ui) {
     panel().show(ui, |ui| {
         ui.set_width(ui.available_width());
-        let ready = app.clip.is_some();
+        let ready = app.media.root().is_some();
         ui.horizontal(|ui| {
             if command_button(
                 ui, app, Action::Preview,
@@ -2132,16 +2132,16 @@ fn loop_panel(app: &mut App, ui: &mut Ui) {
                 Action::Preview.run(app);
             }
             let title = app
-                .source_record(app.active_source)
+                .source_record(app.media.active_source())
                 .map_or("Import audio or dig a record to start chopping", |record| {
                     &record.title
                 });
             ui.add(Label::new(label(title, 15.0, TEXT).strong()).truncate());
         });
-        if app.active_source == 0 && let Some(views) = app.view_count {
+        if app.media.active_source() == 0 && let Some(views) = app.view_count {
             small(ui, views_label(views));
         }
-        if let Some(release) = app.source_record(app.active_source).and_then(|record| record.release.as_ref())
+        if let Some(release) = app.source_record(app.media.active_source()).and_then(|record| record.release.as_ref())
         {
             release_details(ui, release);
         }
@@ -2152,8 +2152,8 @@ fn loop_panel(app: &mut App, ui: &mut Ui) {
             }
             waveform_ruler(app, ui);
         }
-        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), app.wave_height), Sense::hover());
-        let colors = app.library.interface.control_colors();
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), app.view.wave_height), Sense::hover());
+        let colors = preferences::control_colors(app.library.interface);
         ui.painter().rect(
             rect,
             6.0,
@@ -2162,7 +2162,7 @@ fn loop_panel(app: &mut App, ui: &mut Ui) {
             StrokeKind::Inside,
         );
         timeline_at(app, ui, rect.shrink(6.0), "studio_wave", true);
-        if ready && app.waveform.zoom > 1.0 {
+        if ready && app.view.waveform.zoom > 1.0 {
             waveform_overview(app, ui);
         }
         ui.horizontal_wrapped(|ui| {
@@ -2174,8 +2174,8 @@ fn loop_panel(app: &mut App, ui: &mut Ui) {
                 small(ui, "Click to seek · Drag to select or trim a loop");
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let (start, end) = app.waveform.range(app.duration());
-                let visible = if app.waveform.zoom > 1.0 {
+                let (start, end) = app.view.waveform.range(app.duration());
+                let visible = if app.view.waveform.zoom > 1.0 {
                     format!("{} – {}", time(start, true), time(end, true))
                 } else {
                     time(end, true)
@@ -2190,9 +2190,9 @@ fn loop_panel(app: &mut App, ui: &mut Ui) {
             let loop_button = Button::new(label(
                 "Loop   X",
                 13.0,
-                if app.studio.looping { MINT } else { TEXT },
+                if app.project.studio.looping { MINT } else { TEXT },
             ))
-            .fill(if app.studio.looping { GREEN_BG } else { INSET });
+            .fill(if app.project.studio.looping { GREEN_BG } else { INSET });
             if ui
                 .add_enabled(Action::ToggleLoop.unavailable(app).is_none(), loop_button)
                 .clicked()
@@ -2208,14 +2208,14 @@ fn loop_panel(app: &mut App, ui: &mut Ui) {
             if action(
                 ui,
                 "Clear",
-                app.studio.loop_source == app.active_source
-                    && (app.studio.loop_in.is_some() || app.studio.loop_out.is_some()),
+                app.project.studio.loop_source == app.media.active_source()
+                    && (app.project.studio.loop_in.is_some() || app.project.studio.loop_out.is_some()),
             )
             .clicked()
             {
-                app.studio.loop_in = None;
-                app.studio.loop_out = None;
-                app.studio.looping = false;
+                app.project.studio.loop_in = None;
+                app.project.studio.loop_out = None;
+                app.project.studio.looping = false;
             }
             if command_button(ui, app, Action::ExportLoop, "Export loop WAV")
             .on_hover_text("Export the selected source audio at its original sample rate")
@@ -2225,11 +2225,11 @@ fn loop_panel(app: &mut App, ui: &mut Ui) {
             }
         });
         let duration = app.duration();
-        if app.studio.loop_source == app.active_source {
+        if app.project.studio.loop_source == app.media.active_source() {
             ui.horizontal_wrapped(|ui| {
-                time_control(ui, "IN", &mut app.studio.loop_in, duration);
+                time_control(ui, "IN", &mut app.project.studio.loop_in, duration);
                 ui.add_space(10.0);
-                time_control(ui, "OUT", &mut app.studio.loop_out, duration);
+                time_control(ui, "OUT", &mut app.project.studio.loop_out, duration);
             });
         }
     });
@@ -2245,55 +2245,55 @@ fn waveform_zoom(app: &mut App, ui: &mut Ui) {
             app.seek(playhead);
         }
         small(ui, "Snap");
-        ComboBox::from_id_salt("wave_snap").selected_text(app.wave_snap.label()).show_ui(ui, |ui| {
+        ComboBox::from_id_salt("wave_snap").selected_text(app.view.wave_snap.label()).show_ui(ui, |ui| {
             for snap in Snap::ALL {
-                ui.selectable_value(&mut app.wave_snap, snap, snap.label());
+                ui.selectable_value(&mut app.view.wave_snap, snap, snap.label());
             }
         }).response.on_hover_text("Hold Alt to temporarily bypass snapping");
-        ui.checkbox(&mut app.wave_beats, "Beat ruler").on_hover_text("Shows beats from source start at the project tempo");
-        ui.add(DragValue::new(&mut app.wave_height).range(72.0..=340.0).prefix("Height "));
+        ui.checkbox(&mut app.view.wave_beats, "Beat ruler").on_hover_text("Shows beats from source start at the project tempo");
+        ui.add(DragValue::new(&mut app.view.wave_height).range(72.0..=340.0).prefix("Height "));
     });
     ui.horizontal_wrapped(|ui| {
         small(ui, "Zoom");
-        if action(ui, "−", app.waveform.zoom > 1.0)
+        if action(ui, "−", app.view.waveform.zoom > 1.0)
             .on_hover_text("Zoom out around the playhead")
             .clicked()
         {
-            app.waveform.zoom_by(0.5, app.position, duration);
+            app.view.waveform.zoom_by(0.5, app.position, duration);
         }
-        small(ui, format!("{:.1}×", app.waveform.zoom));
-        if action(ui, "+", app.waveform.zoom < WaveformView::MAX_ZOOM)
+        small(ui, format!("{:.1}×", app.view.waveform.zoom));
+        if action(ui, "+", app.view.waveform.zoom < WaveformView::MAX_ZOOM)
             .on_hover_text("Zoom in around the playhead")
             .clicked()
         {
-            app.waveform.zoom_by(2.0, app.position, duration);
+            app.view.waveform.zoom_by(2.0, app.position, duration);
         }
-        if action(ui, "Fit", app.waveform.zoom > 1.0)
+        if action(ui, "Fit", app.view.waveform.zoom > 1.0)
             .on_hover_text("Show the entire source")
             .clicked()
         {
-            app.waveform = WaveformView::default();
+            app.view.waveform = WaveformView::default();
         }
         let selection = app.selection();
         if action(ui, "Zoom to selection", selection.is_some()).clicked()
             && let Some(range) = selection
         {
-            app.waveform.fit(range, duration);
+            app.view.waveform.fit(range, duration);
         }
     });
 }
 
 fn waveform_ruler(app: &App, ui: &mut Ui) {
-    let text_color = app.library.interface.control_colors().secondary_text;
+    let text_color = preferences::control_colors(app.library.interface).secondary_text;
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 18.0), Sense::hover());
-    let (start, end) = app.waveform.range(app.duration());
+    let (start, end) = app.view.waveform.range(app.duration());
     let span = end - start;
     if span <= 0.0 {
         return;
     }
     let desired = span / f64::from((rect.width() / 90.0).max(1.0));
-    let beat = 60.0 / f64::from(app.studio.bpm);
-    let step = if app.wave_beats {
+    let beat = 60.0 / f64::from(app.project.studio.bpm);
+    let step = if app.view.wave_beats {
         (desired / beat).ceil().max(1.0) * beat
     } else {
         let decade = 10.0_f64.powf(desired.log10().floor());
@@ -2308,7 +2308,7 @@ fn waveform_ruler(app: &App, ui: &mut Ui) {
     for index in first..=last {
         let at = index as f64 * step;
         let x = rect.left() + 6.0 + ((at - start) / span) as f32 * (rect.width() - 12.0);
-        let text = if app.wave_beats {
+        let text = if app.view.wave_beats {
             let beat_number = (at / beat).round() as u64;
             format!("{}.{}", beat_number / 4 + 1, beat_number % 4 + 1)
         } else if step < 1.0 {
@@ -2324,7 +2324,7 @@ fn waveform_ruler(app: &App, ui: &mut Ui) {
 fn waveform_overview(app: &mut App, ui: &mut Ui) {
     let Some(clip) = app.active_clip() else { return };
     let interface = app.library.interface;
-    let colors = interface.control_colors();
+    let colors = preferences::control_colors(interface);
     let trace = if interface.high_contrast { colors.secondary_text } else { FAINT };
     let duration = clip.duration();
     let (rect, response) =
@@ -2341,7 +2341,7 @@ fn waveform_overview(app: &mut App, ui: &mut Ui) {
             Stroke::new(1.0_f32, trace),
         );
     }
-    let (start, end) = app.waveform.range(duration);
+    let (start, end) = app.view.waveform.range(duration);
     let at = |seconds: f64| rect.left() + (seconds / duration) as f32 * rect.width();
     let visible = Rect::from_min_max(pos2(at(start), rect.top()), pos2(at(end), rect.bottom()));
     p.rect(
@@ -2355,7 +2355,7 @@ fn waveform_overview(app: &mut App, ui: &mut Ui) {
         && let Some(pointer) = response.interact_pointer_pos()
     {
         let time = f64::from((pointer.x - rect.left()) / rect.width()) * duration;
-        app.waveform.center_on(time, duration);
+        app.view.waveform.center_on(time, duration);
     }
     response.on_hover_text("Click or drag to move around the source");
 }
@@ -2378,9 +2378,9 @@ fn samples_panel(app: &mut App, ui: &mut Ui) {
         ui.set_width(ui.available_width());
         ui.horizontal_wrapped(|ui| {
             ui.label(label("SAMPLES", 13.0, DIM));
-            small(ui, format!("{}", app.samples.len()));
+            small(ui, format!("{}", app.project.samples.len()));
             let selection = app.selection();
-            let can_save = selection.is_some() && app.samples.len() < MAX_NAMED_SAMPLES;
+            let can_save = selection.is_some() && app.project.samples.len() < MAX_NAMED_SAMPLES;
             let name = ui.add_enabled(
                 can_save,
                 egui::TextEdit::singleline(&mut app.sample_name)
@@ -2396,7 +2396,7 @@ fn samples_panel(app: &mut App, ui: &mut Ui) {
                 app.save_selection();
             }
             if let Some(index) = app.selected_sample
-                && selection.is_some_and(|range| range != app.samples[index].range())
+                && selection.is_some_and(|range| range != app.project.samples[index].range())
                 && action(ui, "Update saved cut", true).clicked()
             {
                 app.update_sample(index);
@@ -2416,7 +2416,7 @@ fn samples_panel(app: &mut App, ui: &mut Ui) {
                 }
             }
         });
-        if app.samples.is_empty() {
+        if app.project.samples.is_empty() {
             small(ui, "Select a range on the waveform to save it here.");
             return;
         }
@@ -2424,7 +2424,7 @@ fn samples_panel(app: &mut App, ui: &mut Ui) {
         let query_id = ui.id().with("cut_query");
         let prefix_id = ui.id().with("cut_prefix");
         let mut marked = ui.data(|data| data.get_temp::<Vec<(usize, crate::model::NamedSample)>>(marks_id)).unwrap_or_default();
-        marked.retain(|(index, cut)| app.samples.get(*index) == Some(cut));
+        marked.retain(|(index, cut)| app.project.samples.get(*index) == Some(cut));
         let mut query = ui.data(|data| data.get_temp::<String>(query_id)).unwrap_or_default();
         let mut prefix = ui.data(|data| data.get_temp::<String>(prefix_id)).unwrap_or_default();
         let mut batch_rename = false;
@@ -2447,8 +2447,8 @@ fn samples_panel(app: &mut App, ui: &mut Ui) {
             .id_salt("named_samples")
             .max_height(175.0)
             .show(ui, |ui| {
-                for (index, sample) in app.samples.iter().enumerate() {
-                    let source_title = (!app.studio.sources.is_empty()).then(|| {
+                for (index, sample) in app.project.samples.iter().enumerate() {
+                    let source_title = (!app.project.studio.sources.is_empty()).then(|| {
                         app.source_record(sample.source).map(|record| record.title.clone())
                     }).flatten();
                     if !search.is_empty()
@@ -2458,11 +2458,11 @@ fn samples_panel(app: &mut App, ui: &mut Ui) {
                         continue;
                     }
                     let pad_uses = (0..STEPS)
-                        .filter(|&pad| app.studio.pad_sources[pad] == sample.source && app.pad_range(pad) == Some(sample.range()))
+                        .filter(|&pad| app.project.studio.pad_sources[pad] == sample.source && app.pad_range(pad) == Some(sample.range()))
                         .count();
-                    let key_uses = app.studio.key_chops.iter()
+                    let key_uses = app.project.studio.key_chops.iter()
                         .filter(|&(note, chop)| *chop == KeyChop::Cut(sample.start, sample.end)
-                            && app.studio.key_sources.get(note).copied().unwrap_or(0) == sample.source)
+                            && app.project.studio.key_sources.get(note).copied().unwrap_or(0) == sample.source)
                         .count();
                     ui.push_id(index, |ui| {
                         ui.horizontal_wrapped(|ui| {
@@ -2533,7 +2533,7 @@ fn samples_panel(app: &mut App, ui: &mut Ui) {
                             {
                                 pending = Some(SampleAction::Select(index));
                             }
-                            if action(ui, "Play", app.output.is_some() && !app.playing)
+                            if action(ui, "Play", app.audio.output().is_some() && !app.playing)
                                 .on_hover_text("Audition just this cut")
                                 .clicked()
                             {
@@ -2546,7 +2546,7 @@ fn samples_panel(app: &mut App, ui: &mut Ui) {
                                 pending = Some(SampleAction::Export(index));
                             }
                             ui.menu_button("Cut actions", |ui| {
-                                if action(ui, "Audition with beat", app.output.is_some()).clicked() {
+                                if action(ui, "Audition with beat", app.audio.output().is_some()).clicked() {
                                     pending = Some(SampleAction::BeatAudition(index));
                                     ui.close_menu();
                                 }
@@ -2555,7 +2555,7 @@ fn samples_panel(app: &mut App, ui: &mut Ui) {
                                     pending = Some(SampleAction::AssignPad(index));
                                     ui.close_menu();
                                 }
-                                if action(ui, &format!("Assign to key {}", piano_note(app.piano_key)), !app.studio.chromatic_enabled)
+                                if action(ui, &format!("Assign to key {}", piano_note(app.piano_key)), !app.project.studio.chromatic_enabled)
                                     .on_disabled_hover_text("Switch to Chops per key in Perform")
                                     .clicked()
                                 {
@@ -2581,7 +2581,7 @@ fn samples_panel(app: &mut App, ui: &mut Ui) {
         if batch_rename {
             app.rename_samples(&indices, prefix.trim());
             for (index, cut) in &mut marked {
-                cut.clone_from(&app.samples[*index]);
+                cut.clone_from(&app.project.samples[*index]);
             }
         }
         if batch_export {
@@ -2595,22 +2595,27 @@ fn samples_panel(app: &mut App, ui: &mut Ui) {
         match pending {
             Some(SampleAction::Select(index)) => app.recall_sample(index),
             Some(SampleAction::Play(index)) => {
-                let range = app.samples[index].range();
-                app.select_source(app.samples[index].source);
+                let range = app.project.samples[index].range();
+                app.select_source(app.project.samples[index].source);
                 app.audition_range(range);
             }
             Some(SampleAction::AssignPad(index)) => {
-                let cut = &app.samples[index];
-                app.assign_pad_range(app.selected_pad, cut.source, cut.range());
+                let cut = &app.project.samples[index];
+                app.edit_pad(PadEdit::Assign {
+                    pad: app.selected_pad,
+                    source: cut.source,
+                    range: cut.range(),
+                    name: None,
+                });
             }
             Some(SampleAction::AssignKey(index)) => {
-                let cut = &app.samples[index];
+                let cut = &app.project.samples[index];
                 app.assign_piano_source(cut.source, cut.range());
             }
             Some(SampleAction::BeatAudition(index)) => app.audition_saved_cut_with_beat(index),
             Some(SampleAction::Export(index)) => app.export_sample(index),
             Some(SampleAction::Rename(index)) => {
-                app.sample_rename = Some((index, app.samples[index].name.clone()))
+                app.sample_rename = Some((index, app.project.samples[index].name.clone()))
             }
             Some(SampleAction::CommitName(index, name)) => {
                 app.rename_sample(index, name);
@@ -2693,7 +2698,7 @@ fn timeline_at(app: &mut App, ui: &mut Ui, rect: Rect, id: &str, select_loop: bo
     };
     let duration = clip.duration();
     let (visible_start, visible_end) = if select_loop {
-        app.waveform.range(duration)
+        app.view.waveform.range(duration)
     } else {
         (0.0, duration)
     };
@@ -2713,8 +2718,8 @@ fn timeline_at(app: &mut App, ui: &mut Ui, rect: Rect, id: &str, select_loop: bo
         "Source waveform. Use the Seek, In and Out controls to edit without dragging."));
     let selection_id = response.id.with("loop_drag");
     let loop_range = app.selection();
-    let snap = if ui.input(|input| input.modifiers.alt) { Snap::Off } else { app.wave_snap };
-    let snap_time = |time| snap.time(clip, time, app.studio.bpm);
+    let snap = if ui.input(|input| input.modifiers.alt) { Snap::Off } else { app.view.wave_snap };
+    let snap_time = |time| snap.time(clip, time, app.project.studio.bpm);
     let start_drag = |origin: Pos2| {
         let time = time_at(origin);
         if let Some((start, end)) = loop_range {
@@ -2776,12 +2781,12 @@ fn timeline_at(app: &mut App, ui: &mut Ui, rect: Rect, id: &str, select_loop: bo
     };
     let drag_range = drag.map(|(_, range)| range);
     let interface = app.library.interface;
-    let colors = interface.control_colors();
+    let colors = preferences::control_colors(interface);
     let painter = ui.painter_at(rect);
     if select_loop {
         beat_map::paint(app, &painter, rect, visible.clone());
     }
-    if select_loop && let Some(markers) = app.studio.warp_markers.get(&app.active_source) {
+    if select_loop && let Some(markers) = app.project.studio.warp_markers.get(&app.media.active_source()) {
         for (index, marker) in markers.iter().enumerate() {
             if visible.contains(&marker.source_seconds) {
                 let x = at(marker.source_seconds);
@@ -2827,7 +2832,7 @@ fn timeline_at(app: &mut App, ui: &mut Ui, rect: Rect, id: &str, select_loop: bo
     for &center in centers.iter().take(if stereo { 2 } else { 1 }) {
         painter.hline(rect.x_range(), center, Stroke::new(1.0_f32, colors.edge));
     }
-    let zoomed = select_loop && app.waveform.zoom > 1.0;
+    let zoomed = select_loop && app.view.waveform.zoom > 1.0;
     let bins = if zoomed {
         rect.width().ceil().clamp(1.0, 1200.0) as usize
     } else {
@@ -2860,8 +2865,8 @@ fn timeline_at(app: &mut App, ui: &mut Ui, rect: Rect, id: &str, select_loop: bo
             painter.text(pos2(rect.left() + 4.0, y), Align2::LEFT_TOP, name, FontId::monospace(11.0), TEXT);
         }
     }
-    let markers = if app.studio.loop_source == app.active_source {
-        [app.studio.loop_in, app.studio.loop_out]
+    let markers = if app.project.studio.loop_source == app.media.active_source() {
+        [app.project.studio.loop_in, app.project.studio.loop_out]
     } else {
         [None, None]
     };
@@ -2883,9 +2888,9 @@ fn timeline_at(app: &mut App, ui: &mut Ui, rect: Rect, id: &str, select_loop: bo
             );
         }
     }
-    for (pad, point) in app.studio.pads.iter().enumerate() {
+    for (pad, point) in app.project.studio.pads.iter().enumerate() {
         let Some(point) = point.filter(|point| {
-            app.studio.pad_sources[pad] == app.active_source && visible.contains(point)
+            app.project.studio.pad_sources[pad] == app.media.active_source() && visible.contains(point)
         }) else { continue };
         let x = at(point);
         painter.vline(x, rect.top()..=rect.top() + 9.0, Stroke::new(1.0_f32, BLUE));
@@ -2905,7 +2910,7 @@ fn timeline_at(app: &mut App, ui: &mut Ui, rect: Rect, id: &str, select_loop: bo
             match target {
                 WaveDrag::Select { .. } => app.seek(range.0),
                 WaveDrag::TrimIn { .. } if !app.playing => {
-                    if app.output.is_none() || (app.studio.looping && app.preview) {
+                    if app.audio.output().is_none() || (app.project.studio.looping && app.preview) {
                         app.seek(range.0);
                     } else {
                         app.audition_range(range);
@@ -2937,7 +2942,7 @@ fn pads(app: &mut App, ui: &mut Ui) {
                 }
             });
         });
-        let max_size = if app.studio_view == StudioView::Sample { 70.0 } else { 101.0 };
+        let max_size = if app.view.studio_view == StudioView::Sample { 70.0 } else { 101.0 };
         let pad_size = ((ui.available_width() - 24.0) / 4.0).clamp(48.0, max_size);
         let grid_width = 4.0 * pad_size + 3.0 * 8.0;
         ui.horizontal(|ui| {
@@ -2955,44 +2960,36 @@ fn pads(app: &mut App, ui: &mut Ui) {
         });
         ui.horizontal_wrapped(|ui| {
             slice_menu(app, ui);
-            if action(ui, &format!("Clear pad {}", app.selected_pad + 1), app.studio.pads[app.selected_pad].is_some()).clicked() {
-                app.clear_pad(app.selected_pad);
+            if action(ui, &format!("Clear pad {}", app.selected_pad + 1), app.project.studio.pads[app.selected_pad].is_some()).clicked() {
+                app.edit_pad(PadEdit::Clear(app.selected_pad));
             }
-            let count = app.studio.pads.iter().flatten().count();
+            let count = app.project.studio.pads.iter().flatten().count();
             if action(ui, "Clear all", count > 0).clicked() {
-                for index in 0..STEPS { app.clear_pad(index); }
+                app.edit_pad(PadEdit::ClearAll);
             }
             small(ui, format!("{count} / 16 chops"));
             let selected = app.pad_range(app.selected_pad);
             if action(ui, "Export pad WAV", selected.is_some() && app.busy.is_none()).clicked()
                 && let Some(range) = selected
             {
-                app.export_source_region(app.studio.pad_sources[app.selected_pad], range, &format!("pad-{:02}.wav", app.selected_pad + 1));
+                app.export_source_region(app.project.studio.pad_sources[app.selected_pad], range, &format!("pad-{:02}.wav", app.selected_pad + 1));
             }
         });
-        if app.studio.pads[app.selected_pad].is_some() {
+        if app.project.studio.pads[app.selected_pad].is_some() {
             ui.menu_button("Move or copy pad…", |ui| {
                 let from = app.selected_pad;
                 let range = app.pad_range(from);
                 for to in (0..STEPS).filter(|&pad| pad != from) {
                     ui.horizontal(|ui| {
-                        let assigned = app.studio.pads[to].is_some();
+                        let assigned = app.project.studio.pads[to].is_some();
                         let verb = if assigned { "Swap with" } else { "Move to" };
                         if action(ui, &format!("{verb} pad {}", to + 1), true).clicked() {
-                            app.swap_pads(from, to);
+                            app.edit_pad(PadEdit::Swap { first: from, second: to });
                             ui.close_menu();
                         }
                         if action(ui, "Copy", !assigned && range.is_some()).clicked()
-                            && let Some(range) = range
+                            && app.edit_pad(PadEdit::Copy { from, to })
                         {
-                            app.assign_pad_range(to, app.studio.pad_sources[from], range);
-                            app.studio.pad_names[to] = app.studio.pad_names[from].clone();
-                            app.studio.pad_colors[to] = app.studio.pad_colors[from];
-                            app.studio.pad_controls[to] = app.studio.pad_controls[from];
-                            app.studio.choke_groups.pads[to] = app.studio.choke_groups.pads[from];
-                            if let Some(layers) = app.studio.instruments.pads.get(&from).copied() {
-                                app.studio.instruments.pads.insert(to, layers);
-                            }
                             app.selected_pad = to;
                             ui.close_menu();
                         }
@@ -3001,7 +2998,7 @@ fn pads(app: &mut App, ui: &mut Ui) {
             }).response.on_hover_text("Move sample assignments and sound settings. Sequencer steps keep their pad numbers.");
         }
         if action(ui, "Resample selected pad", app.can_add_source() && !app.recording
-            && app.pad_range(app.selected_pad).is_some() && app.studio.pads.iter().any(Option::is_none))
+            && app.pad_range(app.selected_pad).is_some() && app.project.studio.pads.iter().any(Option::is_none))
             .on_hover_text("Render this pad's sound settings into a new source and assign it to an empty pad")
             .clicked()
         {
@@ -3010,54 +3007,52 @@ fn pads(app: &mut App, ui: &mut Ui) {
         small(ui, "Empty pad sets a marker. Shift-click reassigns. Drop a saved cut onto a pad.");
         ui.separator();
         let pad = app.selected_pad;
-        let duration = app.source_duration(app.studio.pad_sources[pad]);
-        ui.label(label(format!("Pad {:02} · {}", pad + 1, if app.studio.pads[pad].is_some() { "Assigned" } else { "Empty" }), 15.0, MINT).strong());
+        let duration = app.source_duration(app.project.studio.pad_sources[pad]);
+        ui.label(label(format!("Pad {:02} · {}", pad + 1, if app.project.studio.pads[pad].is_some() { "Assigned" } else { "Empty" }), 15.0, MINT).strong());
         ui.horizontal_wrapped(|ui| {
             if action(ui, "Assign selection", app.selection().is_some())
                 .on_hover_text("Assign the waveform selection to the selected pad").clicked()
                 && let Some((start, end)) = app.selection()
             {
-                app.assign_pad_range(pad, app.active_source, (start, end));
+                app.edit_pad(PadEdit::Assign {
+                    pad,
+                    source: app.media.active_source(),
+                    range: (start, end),
+                    name: None,
+                });
             }
             if let Some((start, end)) = app.pad_range(pad) {
-                let mut linked = app.studio.pad_ends[pad].is_none();
+                let mut linked = app.project.studio.pad_ends[pad].is_none();
                 if ui.checkbox(&mut linked, "Link end to next marker").changed() {
-                    app.studio.pad_ends[pad] = (!linked).then_some(end);
+                    app.edit_pad(PadEdit::LinkEnd { pad, linked });
                 }
                 if action(ui, "Show range", true).clicked() {
-                    app.select_source(app.studio.pad_sources[pad]);
-                    app.waveform.reveal((start, end), app.duration());
+                    app.select_source(app.project.studio.pad_sources[pad]);
+                    app.view.waveform.reveal((start, end), app.duration());
                     app.set_loop_range((start, end));
-                    app.studio_view = StudioView::Sample;
+                    app.view.studio_view = StudioView::Sample;
                 }
             }
         });
-        if app.studio.pads[pad].is_some() {
+        if app.project.studio.pads[pad].is_some() {
             ui.horizontal_wrapped(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut app.studio.pad_names[pad])
+                ui.add(egui::TextEdit::singleline(&mut app.project.studio.pad_names[pad])
                     .hint_text("Pad name")
                     .desired_width(128.0)
                     .char_limit(MAX_SAMPLE_NAME));
-                let color = usize::from(app.studio.pad_colors[pad]).min(PAD_COLORS.len() - 1);
+                let color = usize::from(app.project.studio.pad_colors[pad]).min(PAD_COLORS.len() - 1);
                 ComboBox::from_id_salt("pad_color").selected_text(PAD_COLORS[color].0).show_ui(ui, |ui| {
                     for (index, (name, tint)) in PAD_COLORS.into_iter().enumerate() {
-                        ui.selectable_value(&mut app.studio.pad_colors[pad], index as u8, label(name, 13.0, tint));
+                        ui.selectable_value(&mut app.project.studio.pad_colors[pad], index as u8, label(name, 13.0, tint));
                     }
                 });
                 ui.menu_button("Copy to pad", |ui| {
-                    if let Some((start, end)) = app.pad_range(pad) {
+                    if app.pad_range(pad).is_some() {
                         for target in 0..STEPS {
-                            if target != pad && app.studio.pads[target].is_none()
+                            if target != pad && app.project.studio.pads[target].is_none()
                                 && ui.button(format!("Pad {:02}", target + 1)).clicked()
+                                && app.edit_pad(PadEdit::Copy { from: pad, to: target })
                             {
-                                app.assign_pad_range(target, app.studio.pad_sources[pad], (start, end));
-                                app.studio.pad_names[target] = app.studio.pad_names[pad].clone();
-                                app.studio.pad_colors[target] = app.studio.pad_colors[pad];
-                                app.studio.pad_controls[target] = app.studio.pad_controls[pad];
-                                app.studio.choke_groups.pads[target] = app.studio.choke_groups.pads[pad];
-                                if let Some(layers) = app.studio.instruments.pads.get(&pad).copied() {
-                                    app.studio.instruments.pads.insert(target, layers);
-                                }
                                 ui.close_menu();
                             }
                         }
@@ -3065,21 +3060,21 @@ fn pads(app: &mut App, ui: &mut Ui) {
                 }).response.on_hover_text("Copy the current range and controls to an empty pad");
             });
             ui.horizontal_wrapped(|ui| {
-                let last_start = app.studio.pad_ends[pad].map_or(duration, |end| (end - 0.001).max(0.0));
-                time_control(ui, "Start", &mut app.studio.pads[pad], last_start);
+                let last_start = app.project.studio.pad_ends[pad].map_or(duration, |end| (end - 0.001).max(0.0));
+                time_control(ui, "Start", &mut app.project.studio.pads[pad], last_start);
             });
-            if app.studio.pad_ends[pad].is_some() {
-                ui.horizontal_wrapped(|ui| time_control(ui, "End", &mut app.studio.pad_ends[pad], duration));
+            if app.project.studio.pad_ends[pad].is_some() {
+                ui.horizontal_wrapped(|ui| time_control(ui, "End", &mut app.project.studio.pad_ends[pad], duration));
             }
         }
-        ui.add_enabled_ui(app.studio.pads[pad].is_some(), |ui| {
-            sample_controls(ui, &mut app.studio.pad_controls[pad]);
-            choke_group_control(ui, &mut app.studio.choke_groups.pads[pad]);
-            let before = app.studio.pad_layers(pad);
+        ui.add_enabled_ui(app.project.studio.pads[pad].is_some(), |ui| {
+            sample_controls(ui, &mut app.project.studio.pad_controls[pad]);
+            choke_group_control(ui, &mut app.project.studio.choke_groups.pads[pad]);
+            let before = app.project.studio.pad_layers(pad);
             let mut layers = before;
             layers::edit(ui, app, &mut layers);
             if layers != before {
-                app.studio.instruments.pads.insert(pad, layers);
+                app.project.studio.instruments.pads.insert(pad, layers);
             }
         });
     });
@@ -3159,13 +3154,13 @@ fn piano(app: &mut App, ui: &mut Ui) {
             }
         });
         ui.horizontal_wrapped(|ui| {
-            let mut chromatic = app.studio.chromatic_enabled;
+            let mut chromatic = app.project.studio.chromatic_enabled;
             ui.selectable_value(&mut chromatic, false, "Chops per key");
             ui.selectable_value(&mut chromatic, true, "Chromatic sample");
-            if chromatic != app.studio.chromatic_enabled {
+            if chromatic != app.project.studio.chromatic_enabled {
                 app.midi_panic();
                 app.piano_arm = false;
-                app.studio.chromatic_enabled = chromatic;
+                app.project.studio.chromatic_enabled = chromatic;
             }
         });
         let zoom_id = ui.id().with("key_zoom");
@@ -3182,7 +3177,7 @@ fn piano(app: &mut App, ui: &mut Ui) {
             ui.set_min_width(key_width);
             draw_piano_keys(app, ui);
         });
-        if app.studio.chromatic_enabled {
+        if app.project.studio.chromatic_enabled {
             chromatic_controls(app, ui);
             return;
         }
@@ -3194,11 +3189,11 @@ fn piano(app: &mut App, ui: &mut Ui) {
             if let Some((start, end)) = current {
                 small(ui, format!("{} – {}", time(start, true), time(end, true)));
                 if action(ui, "Show on waveform", true).clicked() {
-                    app.select_source(app.studio.key_source(note));
-                    app.waveform.reveal((start, end), app.duration());
+                    app.select_source(app.project.studio.key_source(note));
+                    app.view.waveform.reveal((start, end), app.duration());
                     app.set_loop_range((start, end));
                     app.seek(start);
-                    app.studio_view = StudioView::Sample;
+                    app.view.studio_view = StudioView::Sample;
                 }
             } else {
                 small(ui, "No chop assigned");
@@ -3224,18 +3219,18 @@ fn piano(app: &mut App, ui: &mut Ui) {
                 }
             });
             if let Some((pad, range)) = from_pad {
-                app.assign_piano_source(app.studio.pad_sources[pad], range);
-                app.studio.key_controls.insert(note, app.studio.pad_controls[pad]);
+                app.assign_piano_source(app.project.studio.pad_sources[pad], range);
+                app.project.studio.key_controls.insert(note, app.project.studio.pad_controls[pad]);
             }
             let mut from_sample = None;
             ComboBox::from_id_salt("assign_key_sample").selected_text("Copy named cut…").show_ui(ui, |ui| {
-                for sample in &app.samples {
+                for sample in &app.project.samples {
                     if ui.selectable_label(false, &sample.name).clicked() {
                         from_sample = Some((sample.source, sample.range()));
                         ui.close_menu();
                     }
                 }
-                if app.samples.is_empty() {
+                if app.project.samples.is_empty() {
                     small(ui, "Save a cut in Samples first.");
                 }
             });
@@ -3243,22 +3238,22 @@ fn piano(app: &mut App, ui: &mut Ui) {
                 app.assign_piano_source(source, range);
             }
             if action(ui, "Clear key", current.is_some()).clicked() {
-                app.studio.key_chops.remove(&note);
-                app.studio.key_sources.remove(&note);
+                app.project.studio.key_chops.remove(&note);
+                app.project.studio.key_sources.remove(&note);
                 if Studio::pad_for_key(note).is_some() {
-                    app.studio.key_chops.insert(note, KeyChop::Muted);
+                    app.project.studio.key_chops.insert(note, KeyChop::Muted);
                 }
-                app.studio.key_controls.remove(&note);
-                app.studio.instruments.keys.remove(&note);
+                app.project.studio.key_controls.remove(&note);
+                app.project.studio.instruments.keys.remove(&note);
             }
             if Studio::pad_for_key(note).is_some()
-                && app.studio.key_chops.contains_key(&note)
+                && app.project.studio.key_chops.contains_key(&note)
                 && action(ui, "Use pad default", true).clicked()
             {
-                app.studio.key_chops.remove(&note);
-                app.studio.key_sources.remove(&note);
-                app.studio.key_controls.remove(&note);
-                app.studio.instruments.keys.remove(&note);
+                app.project.studio.key_chops.remove(&note);
+                app.project.studio.key_sources.remove(&note);
+                app.project.studio.key_controls.remove(&note);
+                app.project.studio.instruments.keys.remove(&note);
             }
         });
         if app.piano_arm {
@@ -3270,25 +3265,25 @@ fn piano(app: &mut App, ui: &mut Ui) {
             small(ui, "Computer keys  A W S E D F T G Y H U J K O L P ;  play consecutive semitones.");
         }
         ui.separator();
-        let previous = app.studio.controls_for_key(note);
+        let previous = app.project.studio.controls_for_key(note);
         let mut controls = previous;
         let reset = ui.add_enabled_ui(current.is_some(), |ui| sample_controls(ui, &mut controls)).inner;
         if reset {
-            app.studio.key_controls.remove(&note);
+            app.project.studio.key_controls.remove(&note);
         } else if controls != previous {
-            app.studio.key_controls.insert(note, controls);
+            app.project.studio.key_controls.insert(note, controls);
         }
         if current.is_some() {
-            let before = app.studio.key_layers(note);
+            let before = app.project.studio.key_layers(note);
             let mut layers = before;
             layers::edit(ui, app, &mut layers);
             if layers != before {
-                app.studio.instruments.keys.insert(note, layers);
+                app.project.studio.instruments.keys.insert(note, layers);
             }
-            if app.studio.instruments.keys.contains_key(&note)
+            if app.project.studio.instruments.keys.contains_key(&note)
                 && action(ui, "Reset key layers", true).clicked()
             {
-                app.studio.instruments.keys.remove(&note);
+                app.project.studio.instruments.keys.remove(&note);
             }
         }
     });
@@ -3296,7 +3291,7 @@ fn piano(app: &mut App, ui: &mut Ui) {
 
 fn chromatic_controls(app: &mut App, ui: &mut Ui) {
     ui.horizontal_wrapped(|ui| {
-        let harmony = &mut app.studio.harmony;
+        let harmony = &mut app.project.studio.harmony;
         ComboBox::from_id_salt("harmony_root").selected_text(crate::harmony::ROOTS[usize::from(harmony.root) % 12])
             .show_ui(ui, |ui| {
                 for (index, name) in crate::harmony::ROOTS.into_iter().enumerate() {
@@ -3314,7 +3309,7 @@ fn chromatic_controls(app: &mut App, ui: &mut Ui) {
                 ui.selectable_value(&mut harmony.chord, chord, chord.label());
             }
         });
-        ui.add_enabled_ui(app.studio.chromatic.is_some() && !app.recording, |ui| {
+        ui.add_enabled_ui(app.project.studio.chromatic.is_some() && !app.recording, |ui| {
             ui.menu_button("Write arpeggio…", |ui| {
                 for (title, up, grid) in [
                     ("Up · 1/8", true, Quantize::Eighth),
@@ -3334,14 +3329,14 @@ fn chromatic_controls(app: &mut App, ui: &mut Ui) {
     if action(ui, "Use waveform selection", selection.is_some()).clicked()
         && let Some((start, end)) = selection
     {
-        let previous = app.studio.chromatic;
-        app.studio.chromatic = Some(crate::model::ChromaticSample {
-            source: app.active_source, start, end,
+        let previous = app.project.studio.chromatic;
+        app.project.studio.chromatic = Some(crate::model::ChromaticSample {
+            source: app.media.active_source(), start, end,
             root: previous.map_or(60, |sample| sample.root),
             controls: previous.map_or_else(SampleControls::default, |sample| sample.controls),
         });
     }
-    if let Some(sample) = &mut app.studio.chromatic {
+    if let Some(sample) = &mut app.project.studio.chromatic {
         ui.horizontal_wrapped(|ui| {
             ui.label("Root note");
             ComboBox::from_id_salt("chromatic_root").selected_text(piano_note(sample.root)).show_ui(ui, |ui| {
@@ -3352,10 +3347,10 @@ fn chromatic_controls(app: &mut App, ui: &mut Ui) {
             small(ui, format!("{} to {}", time(sample.start, true), time(sample.end, true)));
         });
         sample_controls(ui, &mut sample.controls);
-        let mut layers = app.studio.instruments.chromatic;
+        let mut layers = app.project.studio.instruments.chromatic;
         layers::edit(ui, app, &mut layers);
-        app.studio.instruments.chromatic = layers;
-        let glide = &mut app.studio.instruments.glide;
+        app.project.studio.instruments.chromatic = layers;
+        let glide = &mut app.project.studio.instruments.glide;
         ui.horizontal_wrapped(|ui| {
             ui.checkbox(&mut glide.mono, "Mono / legato")
                 .on_hover_text("The most recent active key plays. Releasing it returns to the previous key.");
@@ -3430,9 +3425,9 @@ fn draw_piano_keys(app: &mut App, ui: &mut Ui) {
                 (_, false, true) => Color32::from_rgb(32, 29, 30),
                 (_, false, false) => Color32::from_rgb(231, 223, 213),
             };
-            let in_scale = app.studio.chromatic_enabled
-                && app.studio.harmony.scale != crate::harmony::Scale::Chromatic
-                && app.studio.harmony.contains(note);
+            let in_scale = app.project.studio.chromatic_enabled
+                && app.project.studio.harmony.scale != crate::harmony::Scale::Chromatic
+                && app.project.studio.harmony.contains(note);
             let outline = if app.piano_key == note { GOLD } else if in_scale { BLUE } else { EDGE };
             painter.rect(
                 key,
@@ -3455,8 +3450,8 @@ fn draw_piano_keys(app: &mut App, ui: &mut Ui) {
     if let Some(note) = hovered {
         if let Some(cut) = response.dnd_release_payload::<CutDrag>() {
             app.piano_key = note;
-            if app.studio.chromatic_enabled {
-                app.studio.chromatic = Some(crate::model::ChromaticSample {
+            if app.project.studio.chromatic_enabled {
+                app.project.studio.chromatic = Some(crate::model::ChromaticSample {
                     source: cut.source, start: cut.range.0, end: cut.range.1,
                     root: note, controls: SampleControls::default(),
                 });
@@ -3471,8 +3466,8 @@ fn draw_piano_keys(app: &mut App, ui: &mut Ui) {
 fn pad_cell(app: &mut App, ui: &mut Ui, index: usize, size: f32) {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
     let interface = app.library.interface;
-    let colors = interface.control_colors();
-    let assigned = app.studio.pads[index];
+    let colors = preferences::control_colors(interface);
+    let assigned = app.project.studio.pads[index];
     response.widget_info(|| {
         WidgetInfo::labeled(
             WidgetType::Button,
@@ -3485,8 +3480,8 @@ fn pad_cell(app: &mut App, ui: &mut Ui, index: usize, size: f32) {
         )
     });
     let selected = app.selected_pad == index;
-    let name = &app.studio.pad_names[index];
-    let tint = PAD_COLORS[usize::from(app.studio.pad_colors[index]).min(PAD_COLORS.len() - 1)].1;
+    let name = &app.project.studio.pad_names[index];
+    let tint = PAD_COLORS[usize::from(app.project.studio.pad_colors[index]).min(PAD_COLORS.len() - 1)].1;
     let drop_target = response.dnd_hover_payload::<CutDrag>().is_some();
     let held = response.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_down());
     let hold_id = response.id.with("held");
@@ -3546,7 +3541,7 @@ fn pad_cell(app: &mut App, ui: &mut Ui, index: usize, size: f32) {
         FontId::monospace(11.0),
         colors.secondary_text,
     );
-    if let Some(clip) = app.clip.as_deref().and_then(|root| root.source(app.studio.pad_sources[index]))
+    if let Some(clip) = app.source_clip(app.project.studio.pad_sources[index])
         && let Some((start, end)) = app.pad_range(index)
     {
         let waveform = rect.shrink2(vec2(8.0, 25.0));
@@ -3571,10 +3566,15 @@ fn pad_cell(app: &mut App, ui: &mut Ui, index: usize, size: f32) {
         FontId::monospace(11.0),
         if assigned.is_some() { MINT } else if interface.high_contrast { colors.secondary_text } else { FAINT },
     );
-    if let Some(cut) = response.dnd_release_payload::<CutDrag>() {
+    if let Some(cut) = response.dnd_release_payload::<CutDrag>()
+        && app.edit_pad(PadEdit::Assign {
+            pad: index,
+            source: cut.source,
+            range: cut.range,
+            name: Some(cut.name.clone()),
+        })
+    {
         app.selected_pad = index;
-        app.assign_pad_range(index, cut.source, cut.range);
-        app.studio.pad_names[index] = cut.name.clone();
     }
     response.context_menu(|ui| {
         if action(ui, "Select pad", true).clicked() {
@@ -3582,7 +3582,7 @@ fn pad_cell(app: &mut App, ui: &mut Ui, index: usize, size: f32) {
             ui.close_menu();
         }
         if action(ui, "Clear pad", assigned.is_some()).clicked() {
-            app.clear_pad(index);
+            app.edit_pad(PadEdit::Clear(index));
             ui.close_menu();
         }
     });
@@ -3595,12 +3595,15 @@ fn pad_cell(app: &mut App, ui: &mut Ui, index: usize, size: f32) {
     }
 }
 
-fn project_history(app: &mut App, ui: &mut Ui) {
+fn project_history(app: &mut App, ui: &mut Ui) -> bool {
+    let mut traveled = false;
     for (command, title) in [(Action::Snapshots, "Snapshots…"), (Action::Undo, "Undo"), (Action::Redo, "Redo")] {
         if command_button(ui, app, command, title).clicked() {
             command.run(app);
+            traveled |= matches!(command, Action::Undo | Action::Redo);
         }
     }
+    traveled
 }
 
 fn mixer_panel(app: &mut App, ui: &mut Ui) {
@@ -3610,13 +3613,13 @@ fn mixer_panel(app: &mut App, ui: &mut Ui) {
             ui.allocate_ui_with_layout(vec2(width, 0.0), Layout::top_down(Align::Min), |ui| {
                 ui.set_width(width);
                 ui.label(label("DRUM FX", 12.0, DIM).monospace());
-                ui.checkbox(&mut app.studio.drum_fx_bypass, "Bypass drum effects");
-                ui.add_enabled_ui(!app.studio.drum_fx_bypass, |ui| {
-                    fx(ui, "Reverb", &mut app.studio.reverb);
-                    fx(ui, "Delay", &mut app.studio.delay);
-                    fx(ui, "Filter", &mut app.studio.filter);
+                ui.checkbox(&mut app.project.studio.drum_fx_bypass, "Bypass drum effects");
+                ui.add_enabled_ui(!app.project.studio.drum_fx_bypass, |ui| {
+                    fx(ui, "Reverb", &mut app.project.studio.reverb);
+                    fx(ui, "Delay", &mut app.project.studio.delay);
+                    fx(ui, "Filter", &mut app.project.studio.filter);
                 });
-                let division = &mut app.studio.delay_division;
+                let division = &mut app.project.studio.delay_division;
                 let divisions = crate::model::DelayDivision::ALL;
                 let label = divisions.iter().find(|(value, _)| value == division).unwrap().1;
                 ComboBox::from_id_salt("delay_division").selected_text(label)
@@ -3626,20 +3629,20 @@ fn mixer_panel(app: &mut App, ui: &mut Ui) {
                         }
                     }).response.on_hover_text("Tempo-synced delay for drum and arrangement effects");
                 if action(ui, "Reset drum effects", true).clicked() {
-                    app.studio.reverb = 0.0;
-                    app.studio.delay = 0.0;
-                    app.studio.filter = 0.0;
-                    app.studio.drum_fx_bypass = false;
+                    app.project.studio.reverb = 0.0;
+                    app.project.studio.delay = 0.0;
+                    app.project.studio.filter = 0.0;
+                    app.project.studio.drum_fx_bypass = false;
                 }
-                ui.checkbox(&mut app.studio.mix_fx_bypass, "Bypass arrangement effects")
+                ui.checkbox(&mut app.project.studio.mix_fx_bypass, "Bypass arrangement effects")
                     .on_hover_text("Bypass automated delay, reverb, and filtering on the sample and drum buses. Volume automation stays active.");
             });
             ui.allocate_ui_with_layout(vec2(width, 0.0), Layout::top_down(Align::Min), |ui| {
                 ui.set_width(width);
                 ui.label(label("MIX & TIMING", 12.0, DIM).monospace());
-                fx(ui, "Drums", &mut app.studio.drum_level);
-                fx(ui, "Sample", &mut app.studio.sample_level);
-                fx(ui, "Swing", &mut app.studio.swing);
+                fx(ui, "Drums", &mut app.project.studio.drum_level);
+                fx(ui, "Sample", &mut app.project.studio.sample_level);
+                fx(ui, "Swing", &mut app.project.studio.swing);
             });
         });
         ui.separator();
@@ -3664,32 +3667,32 @@ fn mixer_panel(app: &mut App, ui: &mut Ui) {
                 for (index, name) in DRUMS.into_iter().enumerate() {
                     ui.push_id(index, |ui| {
                         ui.horizontal_wrapped(|ui| {
-                            if action(ui, name, app.output.is_some()).on_hover_text("Audition this drum").clicked() {
+                            if action(ui, name, app.audio.output().is_some()).on_hover_text("Audition this drum").clicked() {
                                 app.sync();
                                 app.send(Command::Drum(index));
                             }
-                            let mut source = app.studio.drum_sources[index];
+                            let mut source = app.project.studio.drum_sources[index];
                             let title = source.and_then(|source| app.source_record(source))
                                 .map_or("Built-in sound", |record| record.title.as_str());
                             ComboBox::from_id_salt("drum_source").selected_text(title).show_ui(ui, |ui| {
                                 ui.selectable_value(&mut source, None, "Built-in sound");
-                                for source_index in 0..=app.studio.sources.len() {
+                                for source_index in 0..=app.project.studio.sources.len() {
                                     if let Some(record) = app.source_record(source_index) {
                                         ui.selectable_value(&mut source, Some(source_index), &record.title);
                                     }
                                 }
                             });
-                            app.studio.drum_sources[index] = source;
-                            let strip = &mut app.studio.drum_mix[index];
+                            app.project.studio.drum_sources[index] = source;
+                            let strip = &mut app.project.studio.drum_mix[index];
                             ui.add(DragValue::new(&mut strip.gain).range(0.0..=2.0).speed(0.01).prefix("Gain ×"));
                             ui.add(DragValue::new(&mut strip.pan).range(-1.0..=1.0).speed(0.01).prefix("Pan "));
                             ui.add(DragValue::new(&mut strip.tune).range(-24.0..=24.0).speed(0.1).suffix(" st"));
                             ui.checkbox(&mut strip.mute, "Mute");
                             ui.checkbox(&mut strip.solo, "Solo");
-                            choke_group_control(ui, &mut app.studio.choke_groups.drums[index]);
+                            choke_group_control(ui, &mut app.project.studio.choke_groups.drums[index]);
                             if action(ui, "Reset", true).clicked() {
                                 *strip = Default::default();
-                                app.studio.choke_groups.drums[index] = 0;
+                                app.project.studio.choke_groups.drums[index] = 0;
                             }
                         });
                     });
@@ -3716,7 +3719,7 @@ fn audio_output_controls(app: &mut App, ui: &mut Ui) {
     let draft_id = ui.id().with("output_settings");
     let mut draft = ui.data(|data| data.get_temp::<crate::audio::OutputSettings>(draft_id))
         .unwrap_or_else(|| app.library.audio.clone());
-    if let Some(output) = &app.output {
+    if let Some(output) = app.audio.output() {
         let latency = output.requested_buffer.map_or_else(
             || "system buffer".into(),
             |frames| format!("requested buffer {:.1} ms", 1_000.0 * f64::from(frames) / f64::from(output.sample_rate)),
@@ -3800,8 +3803,8 @@ mod tests {
     fn the_first_and_last_piano_keys_take_distinct_waveform_assignments() {
         let context = Context::default();
         let mut app = App::new(context.clone());
-        app.output = None;
-        app.clip = Some(Arc::new(Clip::new(8_000, vec![[0.0; 2]; 16_000])));
+        app.audio.remove_output();
+        app.media.replace(Some(Arc::new(Clip::new(8_000, vec![[0.0; 2]; 16_000]))));
         let render = |app: &mut App, events| {
             let _ = context.run(
                 egui::RawInput {
@@ -3833,19 +3836,19 @@ mod tests {
             render(&mut app, vec![button(false)]);
             assert_eq!(app.piano_key, note);
             assert!(!app.piano_arm);
-            assert_eq!(app.studio.key_range(note, 2.0), Some(range));
+            assert_eq!(app.project.studio.key_range(note, 2.0), Some(range));
         }
-        assert_eq!(app.studio.key_range(21, 2.0), Some((0.1, 0.3)));
+        assert_eq!(app.project.studio.key_range(21, 2.0), Some((0.1, 0.3)));
     }
 
     #[test]
     fn dragging_the_studio_waveform_sets_the_loop() {
         let context = Context::default();
         let mut app = App::new(context.clone());
-        app.output = None;
-        app.clip = Some(Arc::new(Clip::new(8_000, vec![[0.0; 2]; 80_000])));
+        app.audio.remove_output();
+        app.media.replace(Some(Arc::new(Clip::new(8_000, vec![[0.0; 2]; 80_000]))));
         drag_waveform(&context, &mut app, 85.0, 35.0);
-        assert_eq!(app.studio.loop_range(), Some((2.5, 7.5)));
+        assert_eq!(app.project.studio.loop_range(), Some((2.5, 7.5)));
         assert_eq!(app.position, 2.5);
     }
 
@@ -3853,19 +3856,19 @@ mod tests {
     fn zoomed_handles_trim_independently_and_cannot_cross() {
         let context = Context::default();
         let mut app = App::new(context.clone());
-        app.output = None;
-        app.clip = Some(Arc::new(Clip::new(8_000, vec![[0.0; 2]; 80_000])));
-        app.waveform = WaveformView {
+        app.audio.remove_output();
+        app.media.replace(Some(Arc::new(Clip::new(8_000, vec![[0.0; 2]; 80_000]))));
+        app.view.waveform = WaveformView {
             start: 2.5,
             zoom: 2.0,
         };
         app.set_loop_range((3.75, 6.25));
         drag_waveform(&context, &mut app, 35.0, 60.0);
-        assert_eq!(app.studio.loop_range(), Some((5.0, 6.25)));
+        assert_eq!(app.project.studio.loop_range(), Some((5.0, 6.25)));
         assert_eq!(app.position, 5.0);
         drag_waveform(&context, &mut app, 85.0, 35.0);
         let (start, end) = app
-            .studio
+            .project.studio
             .loop_range()
             .expect("handles must leave a valid loop");
         assert_eq!(start, 5.0);

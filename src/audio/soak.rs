@@ -374,9 +374,9 @@ fn workload(path: &Path, stop: Receiver<()>, progress: Arc<Workload>) -> files::
         assert!(fit.fitted.is_some(), "{:?}", fit.status);
         files::save_project(
             &path.join("soak.flip"),
-            &files::Project {
+            &crate::model::project::Project {
                 studio: studio.clone(),
-                ..files::Project::default()
+                ..crate::model::project::Project::default()
             },
             Some(&clip),
         )?;
@@ -474,7 +474,7 @@ fn windows_audio_dropout_soak() -> files::Result<()> {
             .map(|i| [phase(i % (rate / 100) as usize, rate, PILOT_HZ).sin() * PILOT_LEVEL; 2])
             .collect(),
     ));
-    output.send(Command::Settings(Box::new(studio)));
+    output.send(Command::Settings(Box::new((&studio).into())));
     output.send(Command::Pattern(true));
     output.send(Command::BeatAuditionGain(1.0));
     output.queue_beat_audition(pilot, (0.0, 2.0), Some(1));

@@ -43,9 +43,9 @@ pub(super) fn panel(app: &mut App, ui: &mut Ui) {
             }
         });
     }
-    let source = app.active_source;
+    let source = app.media.active_source();
     let mut map = app
-        .studio
+        .project.studio
         .beat_maps
         .get(&source)
         .cloned()
@@ -112,7 +112,7 @@ pub(super) fn panel(app: &mut App, ui: &mut Ui) {
             }
             if action(ui, "Show beat", true).clicked() {
                 app.seek(at);
-                app.waveform.center_on(at, duration);
+                app.view.waveform.center_on(at, duration);
             }
             if action(ui, "Set first downbeat", true).clicked() {
                 Arc::make_mut(&mut map).set_downbeat(index);
@@ -177,7 +177,7 @@ pub(super) fn panel(app: &mut App, ui: &mut Ui) {
     }
     ui.data_mut(|data| data.insert_temp(selection_id, index));
     if changed {
-        app.studio.beat_maps.insert(source, map.clone());
+        app.project.studio.beat_maps.insert(source, map.clone());
     }
     if let Some(provenance) = &map.provenance {
         small(
@@ -242,7 +242,7 @@ pub(super) fn warp_preview(app: &mut App, ui: &mut Ui) {
         ),
     );
     ui.horizontal_wrapped(|ui| {
-        let can_listen = app.output.is_some() && !app.recording;
+        let can_listen = app.audio.output().is_some() && !app.recording;
         if action(ui, "Audition original", can_listen).clicked() {
             app.audition_warp(false);
         }
@@ -260,7 +260,7 @@ pub(super) fn warp_preview(app: &mut App, ui: &mut Ui) {
         }
         if action(ui, "Edit bounds and markers", app.warp_preview().is_some()).clicked() {
             app.edit_warp_proposal();
-            app.sample_tool = Some(super::sample::Tool::Warp);
+            app.view.sample_tool = Some(super::sample::Tool::Warp);
         }
         if action(ui, "Dismiss preview", app.warp_preview().is_some()).clicked() {
             app.discard_warp_preview();
@@ -310,7 +310,7 @@ pub(super) fn paint(app: &App, painter: &Painter, rect: Rect, visible: RangeIncl
     if let Some(proposal) = app.beat_proposal() {
         draw(&proposal.beats, true);
     }
-    if let Some(map) = app.studio.beat_maps.get(&app.active_source) {
+    if let Some(map) = app.project.studio.beat_maps.get(&app.media.active_source()) {
         draw(&map.beats, false);
         for &at in &map.phrases {
             if visible.contains(&at) {

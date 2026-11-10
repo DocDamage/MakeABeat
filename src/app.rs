@@ -1,8 +1,12 @@
 pub(crate) mod actions;
+pub(crate) mod arrangement_workflow;
+mod audio_runtime;
 mod audition_workflow;
 mod beat_workflow;
 mod extraction_workflow;
 mod groove_workflow;
+pub(crate) mod pad_workflow;
+pub(crate) mod piano_roll_workflow;
 mod library_persistence;
 mod recovery_workflow;
 pub(crate) mod sequence_workflow;
@@ -10,18 +14,21 @@ pub(crate) mod search_workflow;
 mod taste_workflow;
 pub(crate) mod transcription_workflow;
 mod project_session;
+mod project_media;
+mod view_state;
 
 use actions::Action;
+pub use view_state::{Page, StudioView};
 use crate::{
     analysis::{AudioProfile, Emphasis, MatchBy, Sound},
     audio::{CapturedChop, Clip, Command, Output, PadMode},
     catalog::ReleaseFilters,
-    files::{self, Project},
+    files,
     midi::{self, Message, Route, Signal, Target},
     model::{
         BarContent, ChopInput, DRUMS, DawTarget, DigPreset, GENRES, KeyChop, Library, MAX_NAMED_SAMPLES, MAX_PATTERNS,
         NamedSample, PIANO_HIGH, PIANO_LOW, PlayedChop, Quantize, QueueEntry, Record, STEPS,
-        SampleBank, SampleControls, SavedRecord, Source, Studio, Verdict,
+        SampleBank, SampleControls, SavedRecord, Source, Studio, Verdict, project::Project,
     },
     waveform::WaveformView,
     youtube::DigFilters,
@@ -36,24 +43,6 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Page {
-    Dig,
-    Queue,
-    Studio,
-    Search,
-    Crate,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StudioView {
-    Sample,
-    Perform,
-    Sequence,
-    Arrange,
-    Mix,
-}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Pool {
@@ -166,15 +155,13 @@ pub struct SceneRun {
 
 pub struct App {
     session: project_session::Session,
+    pub(crate) project: Project,
     pending_change: Option<PendingChange>,
     discard_after_analysis: bool,
     finishing_close: bool,
     closing: bool,
     ctx: egui::Context,
-    pub page: Page,
-    pub show_commands: bool,
-    pub focus_commands: bool,
-    pub command_query: String,
+    pub(crate) view: view_state::ViewState,
     pub pool: Pool,
     pub genres: [bool; GENRES.len()],
     pub dig_decade: Option<u16>,
@@ -207,30 +194,19 @@ pub struct App {
     #[cfg(windows)]
     pub drag_export: Option<PathBuf>,
     pub daw_delivery: Option<crate::daw::Delivery>,
-    pub record: Option<Record>,
     pub view_count: Option<u64>,
     analysis: beat_workflow::Analysis,
     pub(crate) audition: audition_workflow::Audition,
     pub(crate) groove_editor: groove_workflow::GrooveEditor,
     pub(crate) search: search_workflow::Search,
     pub tempo_estimate: Option<crate::tempo::Estimate>,
-    pub clip: Option<Arc<Clip>>,
-    detached_clip: Option<Arc<Clip>>,
-    pub active_source: usize,
-    pub studio: Studio,
-    pub waveform: WaveformView,
-    pub wave_snap: crate::waveform::Snap,
-    pub wave_beats: bool,
-    pub wave_height: f32,
-    pub samples: Vec<NamedSample>,
+    pub(crate) media: project_media::ProjectMedia,
     pub sample_name: String,
     pub suggestion_bars: u8,
     pub suggestion_emphasis: Emphasis,
     pub match_priority: MatchBy,
     pub sample_rename: Option<(usize, String)>,
     pub selected_sample: Option<usize>,
-    samples_in_project: bool,
-    sent: Studio,
     pub library: Library,
     pub collection: Option<String>,
     pub new_collection: Option<String>,
@@ -239,11 +215,9 @@ pub struct App {
     pub history_cursor: Option<usize>,
     demos: Vec<Record>,
     folder: Vec<Record>,
-    pub output: Option<Output>,
-    pub audio_error: Option<String>,
+    pub(crate) audio: audio_runtime::AudioRuntime,
     pub capture_quantize: Quantize,
     pub position: f64,
-    seeked_at: Option<Instant>,
     pub preview: bool,
     pub playing: bool,
     pub song_playing: Option<u64>,
@@ -253,8 +227,6 @@ pub struct App {
     pub scene_capture: bool,
     pub scene_take: Vec<SceneRun>,
     song_request: u64,
-    pub studio_view: StudioView,
-    pub arrangement_timeline: crate::ui::arrangement::Timeline,
     pub pattern_name: String,
     pub recording: bool,
     pub input_recording: Option<crate::input_audio::Recording>,
@@ -273,7 +245,6 @@ pub struct App {
     pub punch_last: usize,
     pub fill: bool,
     pub quantize: Quantize,
-    pub piano_roll: Option<crate::ui::piano_roll::PianoRoll>,
     pub(crate) transcription: transcription_workflow::State,
     pub(crate) extraction: extraction_workflow::State,
     pub piano_roll_clipboard: Vec<PlayedChop>,
@@ -312,14 +283,9 @@ pub struct App {
     pub bar: usize,
     pub bar_clipboard: Option<BarContent>,
     pub drum_templates: Option<crate::ui::drum_templates::Browser>,
-    pub(crate) sequence_tool: Option<crate::ui::sequencer::Tool>,
-    pub(crate) sample_tool: Option<crate::ui::sample::Tool>,
     pub(crate) reveal_audio_output: bool,
     pub variations: Option<crate::ui::variation::Dialog>,
     pub snapshot_dialog: Option<crate::ui::snapshots::Dialog>,
-    pub snapshots: Arc<Vec<crate::model::snapshot::NamedSnapshot>>,
-    source_ids: Vec<crate::model::snapshot::SourceId>,
-    next_source_id: u64,
     snapshot_preview_request: Option<u64>,
     snapshot_preview: Option<([Arc<Clip>; 2], [f32; 2])>,
     pub taps: Vec<Instant>,
@@ -333,11 +299,8 @@ pub struct App {
 impl App {
     pub fn new(ctx: egui::Context) -> Self {
         let (library, library_recovery) = files::read_library();
-        library.interface.apply(&ctx);
-        let (output, audio_error) = match Output::open(&library.audio) {
-            Ok(output) => (Some(output), None),
-            Err(error) => (None, Some(error)),
-        };
+        crate::ui::preferences::apply(library.interface, &ctx);
+        let audio = audio_runtime::AudioRuntime::open(&library.audio);
         let rng = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(1, |t| t.as_nanos() as u64);
@@ -348,16 +311,14 @@ impl App {
                 rng,
                 ctx.clone(),
             ),
+            project: Project::default(),
             pending_change: None,
             discard_after_analysis: false,
             finishing_close: false,
             closing: false,
             library_persistence: library_persistence::Persistence::new(ctx.clone()),
             ctx,
-            page: Page::Dig,
-            show_commands: false,
-            focus_commands: false,
-            command_query: String::new(),
+            view: Default::default(),
             pool: Pool::YouTube,
             genres: [false; GENRES.len()],
             dig_decade: None,
@@ -390,30 +351,19 @@ impl App {
             #[cfg(windows)]
             drag_export: None,
             daw_delivery: None,
-            record: None,
             view_count: None,
             analysis: beat_workflow::Analysis::default(),
             audition: Default::default(),
             groove_editor: Default::default(),
             search: Default::default(),
             tempo_estimate: None,
-            clip: None,
-            detached_clip: None,
-            active_source: 0,
-            studio: Studio::default(),
-            waveform: WaveformView::default(),
-            wave_snap: Default::default(),
-            wave_beats: false,
-            wave_height: 118.0,
-            samples: Vec::new(),
+            media: Default::default(),
             sample_name: String::new(),
             suggestion_bars: 2,
             suggestion_emphasis: Emphasis::Balanced,
             match_priority: MatchBy::Balanced,
             sample_rename: None,
             selected_sample: None,
-            samples_in_project: false,
-            sent: Studio::default(),
             library,
             library_recovery: library_recovery.map(Arc::new),
             collection: None,
@@ -423,11 +373,9 @@ impl App {
             history_cursor: None,
             demos: files::demos(),
             folder: Vec::new(),
-            output,
-            audio_error,
+            audio,
             capture_quantize: Quantize::Off,
             position: 0.0,
-            seeked_at: None,
             preview: false,
             playing: false,
             song_playing: None,
@@ -437,8 +385,6 @@ impl App {
             scene_capture: false,
             scene_take: Vec::new(),
             song_request: 0,
-            studio_view: StudioView::Sample,
-            arrangement_timeline: Default::default(),
             pattern_name: String::new(),
             recording: false,
             input_recording: None,
@@ -457,7 +403,6 @@ impl App {
             punch_last: 1,
             fill: false,
             quantize: Quantize::Off,
-            piano_roll: None,
             transcription: Default::default(),
             extraction: Default::default(),
             piano_roll_clipboard: Vec::new(),
@@ -496,14 +441,9 @@ impl App {
             bar: 0,
             bar_clipboard: None,
             drum_templates: None,
-            sequence_tool: None,
-            sample_tool: None,
             reveal_audio_output: false,
             variations: None,
             snapshot_dialog: None,
-            snapshots: Arc::default(),
-            source_ids: Vec::new(),
-            next_source_id: 1,
             snapshot_preview_request: None,
             snapshot_preview: None,
             taps: Vec::new(),
@@ -514,15 +454,25 @@ impl App {
     }
 
     pub fn source_record(&self, index: usize) -> Option<&Record> {
-        if index == 0 { self.record.as_ref() } else { self.studio.sources.get(index - 1) }
+        if index == 0 { self.project.record.as_ref() } else { self.project.studio.sources.get(index - 1) }
+    }
+
+    pub(crate) fn source_clip(&self, index: usize) -> Option<&Clip> {
+        if index > self.project.studio.sources.len() {
+            return None;
+        }
+        self.media.root()?.source(index)
     }
 
     pub fn active_clip(&self) -> Option<&Clip> {
-        self.clip.as_deref()?.source(self.active_source)
+        self.source_clip(self.media.active_source())
     }
 
     fn source_arc(&self, index: usize) -> Option<Arc<Clip>> {
-        Clip::source_arc(self.clip.as_ref()?, index)
+        if index > self.project.studio.sources.len() {
+            return None;
+        }
+        Clip::source_arc(self.media.root()?, index)
     }
 
     pub fn duration(&self) -> f64 {
@@ -530,28 +480,28 @@ impl App {
     }
 
     pub fn source_duration(&self, index: usize) -> f64 {
-        self.clip.as_deref().and_then(|clip| clip.source(index)).map_or(0.0, Clip::duration)
+        self.source_clip(index).map_or(0.0, Clip::duration)
     }
 
     pub fn pad_range(&self, index: usize) -> Option<(f64, f64)> {
-        self.studio.slice(index, self.source_duration(self.studio.pad_sources[index]))
+        self.project.studio.slice(index, self.source_duration(self.project.studio.pad_sources[index]))
     }
 
     pub fn key_range(&self, note: u8) -> Option<(f64, f64)> {
-        self.studio.key_range(note, self.source_duration(self.studio.key_source(note)))
+        self.project.studio.key_range(note, self.source_duration(self.project.studio.key_source(note)))
     }
 
     pub fn selection(&self) -> Option<(f64, f64)> {
-        if self.studio.loop_source == self.active_source { self.studio.loop_range() } else { None }
+        if self.project.studio.loop_source == self.media.active_source() { self.project.studio.loop_range() } else { None }
     }
 
     pub fn select_source(&mut self, index: usize) {
-        if index == self.active_source || index > self.studio.sources.len() {
+        if index == self.media.active_source() || index > self.project.studio.sources.len() {
             return;
         }
         self.clear_extraction();
-        self.active_source = index;
-        self.waveform = WaveformView::default();
+        self.media.select(index);
+        self.view.waveform = WaveformView::default();
         self.suggestions.clear();
         self.tempo_estimate = None;
         self.selected_sample = None;
@@ -562,120 +512,37 @@ impl App {
     }
 
     pub fn set_loop_edge(&mut self, is_start: bool) {
-        if self.studio.loop_source != self.active_source {
-            self.studio.loop_source = self.active_source;
-            self.studio.loop_in = None;
-            self.studio.loop_out = None;
-            self.studio.looping = false;
+        if self.project.studio.loop_source != self.media.active_source() {
+            self.project.studio.loop_source = self.media.active_source();
+            self.project.studio.loop_in = None;
+            self.project.studio.loop_out = None;
+            self.project.studio.looping = false;
         }
         if is_start {
-            self.studio.loop_in = Some(self.position);
+            self.project.studio.loop_in = Some(self.position);
         } else {
-            self.studio.loop_out = Some(self.position);
+            self.project.studio.loop_out = Some(self.position);
         }
     }
 
-    pub fn assign_pad_range(&mut self, pad: usize, source: usize, (start, end): (f64, f64)) {
-        self.studio.pads[pad] = Some(start);
-        self.studio.pad_ends[pad] = Some(end);
-        self.studio.pad_sources[pad] = source;
-    }
-
-    pub fn swap_pads(&mut self, first: usize, second: usize) {
-        // Resolve linked ends before moving either start marker.
-        for pad in [first, second] {
-            if let Some((_, end)) = self.pad_range(pad) {
-                self.studio.pad_ends[pad] = Some(end);
-            }
-        }
-        self.studio.pads.swap(first, second);
-        self.studio.pad_ends.swap(first, second);
-        self.studio.pad_sources.swap(first, second);
-        self.studio.pad_names.swap(first, second);
-        self.studio.pad_colors.swap(first, second);
-        self.studio.pad_controls.swap(first, second);
-        self.studio.choke_groups.pads.swap(first, second);
-        let a = self.studio.instruments.pads.remove(&first);
-        let b = self.studio.instruments.pads.remove(&second);
-        self.studio.instruments.pads.extend(a.map(|layers| (second, layers)));
-        self.studio.instruments.pads.extend(b.map(|layers| (first, layers)));
-        self.selected_pad = second;
+    fn assign_pad_range(&mut self, pad: usize, source: usize, (start, end): (f64, f64)) {
+        self.project.studio.pads[pad] = Some(start);
+        self.project.studio.pad_ends[pad] = Some(end);
+        self.project.studio.pad_sources[pad] = source;
     }
 
     pub fn send(&self, command: Command) {
-        if let Some(output) = &self.output {
-            output.send(command);
-        }
+        self.audio.send(command);
     }
 
     pub(crate) fn sync(&mut self) {
-        self.studio.validate_media(self.clip.as_deref());
-        self.studio.identify_working_events();
-        self.studio.sync_pattern();
-        if !self.source_ids.is_empty() || !self.snapshots.is_empty() || self.studio.uses_beat_maps() {
+        self.project.studio.validate_media(self.media.root_clip());
+        self.project.studio.identify_working_events();
+        self.project.studio.sync_pattern();
+        if !self.project.source_ids.is_empty() || !self.project.snapshots.is_empty() || self.project.studio.uses_beat_maps() {
             self.sync_source_ids();
         }
-        if self.sent != self.studio {
-            if !self.sent.same_capture_instruments(&self.studio)
-                && let Some(output) = &self.output
-            {
-                output.performance.invalidate_preview();
-            }
-            let settings = self.audio_settings();
-            let mut previous = std::mem::take(&mut self.sent);
-            previous.beat_maps.clear();
-            previous.warp_sources.clear();
-            previous.grooves.clear();
-            if settings != previous {
-                self.send(Command::Settings(Box::new(settings)));
-            }
-            self.sent = self.studio.clone();
-        }
-    }
-
-    fn audio_settings(&self) -> Studio {
-        let mut settings = self.studio.clone();
-        settings.beat_maps.clear();
-        settings.warp_sources.clear();
-        settings.grooves.clear();
-        settings
-    }
-
-    pub fn retry_audio(&mut self) {
-        self.set_audio_output(self.library.audio.clone());
-    }
-
-    pub fn set_audio_output(&mut self, settings: crate::audio::OutputSettings) {
-        if self.recording || self.input_recording.is_some() {
-            return;
-        }
-        match Output::open(&settings) {
-            Ok(output) => {
-                self.stop_all();
-                self.output = Some(output);
-                self.audio_error = None;
-                self.send(Command::Settings(Box::new(self.audio_settings())));
-                self.send(Command::Clip(self.clip.clone()));
-                self.send(Command::PreviewSource(self.active_source));
-                self.send(Command::ClickTrack(self.click_track));
-                self.send(Command::ClickGain(self.click_gain));
-                self.send(Command::Fill(self.fill));
-                if self.midi_clock_connection.is_some() {
-                    self.midi.route_clock(
-                        self.midi_clock_connection,
-                        self.output.as_ref().map(Output::sender),
-                        self.studio.bpm,
-                    );
-                }
-                self.seek(self.position);
-                if self.library.audio != settings {
-                    self.library.audio = settings;
-                    self.persist_library();
-                }
-            }
-            Err(error) if self.output.is_some() => self.status = Some((error, true)),
-            Err(error) => self.audio_error = Some(error),
-        }
+        self.audio.sync(&self.project.studio);
     }
 
     fn random(&mut self) -> u64 {
@@ -799,7 +666,7 @@ impl App {
             } => {
                 let mut settings = restore.map_or_else(
                     || {
-                        let mut settings = self.studio.clone();
+                        let mut settings = self.project.studio.clone();
                         if !settings.has_pattern() && settings.patterns.is_empty() {
                             settings.bpm = bpm;
                         }
@@ -834,7 +701,11 @@ impl App {
                     |settings| *settings,
                 );
                 settings.validate(clip.duration());
-                self.set_record(Some(record.clone()), Some(clip), settings);
+                self.replace_project(
+                    Project { record: Some(record.clone()), studio: settings, ..Default::default() },
+                    Some(clip),
+                    false,
+                );
                 self.view_count = view_count;
                 if let Some(start) = start.filter(|&start| start < self.duration()) {
                     self.seek(start);
@@ -846,35 +717,29 @@ impl App {
                     self.persist_library();
                     Some(self.history.len() - 1)
                 });
-                self.session.reset(self.project_snapshot(), None, None);
+                self.session.reset(self.project.clone(), None, None);
                 self.toggle_preview();
                 if open_studio {
                     self.youtube_url = None;
-                    self.page = Page::Studio;
+                    self.view.page = Page::Studio;
                 }
             }
             Job::Opened(project, clip, path, kind) => {
-                self.set_record(project.record, clip, project.studio);
-                self.samples = project.samples;
-                self.source_ids = project.source_ids;
-                self.next_source_id = self.source_ids.iter().map(|id| id.0).max().unwrap_or(0).saturating_add(1);
-                self.snapshots = project.snapshots;
-                self.sync();
-                self.samples_in_project = true;
+                self.replace_project(*project, clip, true);
                 self.history_cursor = None;
-                self.page = Page::Studio;
+                self.view.page = Page::Studio;
                 match kind {
                     OpenKind::Recovery => {
                         self.session.available_recovery = None;
-                        self.session.reset(self.project_snapshot(), None, Some(path));
+                        self.session.reset(self.project.clone(), None, Some(path));
                         self.status = Some(("Session recovered. Save it as a project.".into(), false));
                     }
                     OpenKind::Template => {
-                        self.session.reset(self.project_snapshot(), None, None);
+                        self.session.reset(self.project.clone(), None, None);
                         self.status = Some(("New project created from template.".into(), false));
                     }
                     OpenKind::Project => {
-                        self.session.reset(self.project_snapshot(), Some(path.clone()), None);
+                        self.session.reset(self.project.clone(), Some(path.clone()), None);
                         self.remember_project(path);
                         self.status = Some(("Project opened.".into(), false));
                     }
@@ -882,7 +747,7 @@ impl App {
             }
             Job::Saved(path, snapshot) => {
                 self.session.mark_saved(path.clone(), snapshot);
-                self.samples_in_project = true;
+                self.session.samples_in_project = true;
                 self.remember_project(path.clone());
                 self.status = Some((format!("Saved {}", path.display()), false));
                 if !self.session.dirty() {
@@ -898,15 +763,15 @@ impl App {
             }
             Job::Wrote(message) => self.status = Some((message, false)),
             Job::Tempo(source, estimate) => {
-                if source == self.active_source {
+                if source == self.media.active_source() {
                     self.tempo_estimate = Some(estimate);
                 }
             }
             Job::SourceAdded(record, clip, pad) => {
                 let pad = if let Some(wanted) = pad {
-                    if self.studio.pads[wanted].is_none() {
+                    if self.project.studio.pads[wanted].is_none() {
                         Some(wanted)
-                    } else if let Some(next) = self.studio.pads.iter().position(Option::is_none) {
+                    } else if let Some(next) = self.project.studio.pads.iter().position(Option::is_none) {
                         Some(next)
                     } else {
                         self.status = Some(("Free a pad before resampling the pattern.".into(), true));
@@ -916,34 +781,32 @@ impl App {
                     None
                 };
                 self.stop_all();
-                self.detached_clip = None;
                 let duration = clip.duration();
-                if let Some(root) = &mut self.clip {
-                    let root = Arc::make_mut(root);
-                    root.sources.truncate(self.studio.sources.len());
-                    root.sources.push(Arc::new(clip));
-                    self.studio.sources.push(record);
-                    self.active_source = 0;
-                    self.send(Command::Clip(self.clip.clone()));
-                    self.select_source(self.studio.sources.len());
+                let source = self.media.append(clip, self.project.studio.sources.len());
+                if source == 0 {
+                    self.project.record = Some(record);
+                    self.view.waveform = WaveformView::default();
                 } else {
-                    self.clip = Some(Arc::new(clip));
-                    self.record = Some(record);
-                    self.waveform = WaveformView::default();
-                    self.send(Command::Clip(self.clip.clone()));
-                    self.seek(0.0);
+                    self.project.studio.sources.push(record);
                 }
-                self.samples_in_project = true;
+                self.media.select(0);
+                self.send(Command::Clip(self.media.root().cloned()));
+                if source == 0 {
+                    self.seek(0.0);
+                } else {
+                    self.select_source(source);
+                }
+                self.session.samples_in_project = true;
                 if let Some(pad) = pad {
-                    let name = self.source_record(self.active_source)
+                    let name = self.source_record(self.media.active_source())
                         .map_or_else(|| "Bounce".into(), |record| record.title.clone());
-                    self.assign_pad_range(pad, self.active_source, (0.0, duration));
-                    self.studio.pad_names[pad] = name;
-                    self.studio.pad_controls[pad] = SampleControls::default();
+                    self.assign_pad_range(pad, self.media.active_source(), (0.0, duration));
+                    self.project.studio.pad_names[pad] = name;
+                    self.project.studio.pad_controls[pad] = SampleControls::default();
                     self.selected_pad = pad;
                 }
-                self.page = Page::Studio;
-                self.studio_view = StudioView::Sample;
+                self.view.page = Page::Studio;
+                self.view.studio_view = StudioView::Sample;
             }
             Job::StemsAdded(stems) => {
                 let count = stems.len();
@@ -996,12 +859,12 @@ impl App {
                 }
                 self.queue_tab = Verdict::Pending;
                 self.queue_similar = similar;
-                self.page = Page::Queue;
+                self.view.page = Page::Queue;
                 self.status = Some((format!("{count} tracks added to the queue."), false));
                 self.invalidate_taste();
                 self.persist_library();
             }
-            Job::Listen(source, clip, range) if self.page == Page::Queue && self.output.is_some() => {
+            Job::Listen(source, clip, range) if self.view.page == Page::Queue && self.audio.output().is_some() => {
                 self.queue_audio = Some(QueueAudio {
                     source,
                     clip: Arc::new(clip),
@@ -1022,7 +885,7 @@ impl App {
                 }
             }
             Job::Suggestions(source, suggestions) => {
-                if source != self.active_source {
+                if source != self.media.active_source() {
                     return;
                 }
                 self.status = Some((
@@ -1056,79 +919,6 @@ impl App {
                 self.drag_export = Some(path);
                 self.status = Some(("WAV ready to drag.".into(), false));
             }
-        }
-    }
-
-    fn set_record(&mut self, record: Option<Record>, clip: Option<Clip>, mut studio: Studio) {
-        self.reset_analysis();
-        self.clear_transcription();
-        self.clear_extraction();
-        self.stop_beat_audition();
-        self.groove_editor = Default::default();
-        self.scene_active = None;
-        self.scene_pending = None;
-        self.scene_capture = false;
-        self.scene_take.clear();
-        self.stop_listening();
-        self.suggestions.clear();
-        self.tempo_estimate = None;
-        self.playing = false;
-        self.song_playing = None;
-        self.studio_view = StudioView::Sample;
-        self.variations = None;
-        self.snapshot_dialog = None;
-        self.snapshots = Arc::default();
-        self.source_ids.clear();
-        self.next_source_id = 1;
-        self.clear_snapshot_preview();
-        self.arrangement_timeline = Default::default();
-        self.stop_recording();
-        self.recording_project += 1;
-        self.piano_roll = None;
-        self.piano_roll_clipboard.clear();
-        self.bar_clipboard = None;
-        self.recorded_gates.clear();
-        self.preview = false;
-        self.step = None;
-        self.send(Command::Pattern(false));
-        self.send(Command::Play(false));
-        self.record = record;
-        self.view_count = None;
-        self.active_source = 0;
-        self.detached_clip = None;
-        self.clip = clip.map(Arc::new);
-        studio.validate_media(self.clip.as_deref());
-        studio.validate_source_analysis(self.clip.as_deref());
-        studio.validate_song();
-        studio.identify_saved_events();
-        self.studio = studio;
-        self.waveform = WaveformView::default();
-        self.samples = self
-            .record
-            .as_ref()
-            .and_then(|record| {
-                self.library
-                    .sample_banks
-                    .iter()
-                    .find(|bank| bank.source == record.source)
-            })
-            .map_or_else(Vec::new, |bank| bank.samples.clone());
-        let duration = self.duration();
-        NamedSample::validate_list(&mut self.samples, duration);
-        self.samples_in_project = false;
-        self.sample_name.clear();
-        self.sample_rename = None;
-        self.selected_sample = None;
-        self.taps.clear();
-        self.bar = 0;
-        self.selected_pad = 0;
-        self.send(Command::Clip(self.clip.clone()));
-        self.sync();
-        let source = self.studio.loop_source;
-        if source == 0 {
-            self.seek(self.studio.loop_in.unwrap_or(0.0));
-        } else {
-            self.select_source(source);
         }
     }
 
@@ -1217,7 +1007,7 @@ impl App {
                 &selected
             };
             let genre = genres[index % genres.len()];
-            let active = self.record.as_ref().and_then(youtube_id).map(str::to_owned);
+            let active = self.project.record.as_ref().and_then(youtube_id).map(str::to_owned);
             let heard = self
                 .library
                 .heard_sources
@@ -1266,7 +1056,7 @@ impl App {
             });
             return;
         }
-        let active = self.record.clone();
+        let active = self.project.record.clone();
         if self.pool == Pool::Commons {
             let genre = if selected.is_empty() {
                 "All"
@@ -1388,7 +1178,7 @@ impl App {
         };
         let reference =
             sample.and_then(|index| {
-                let sample = self.samples.get(index)?;
+                let sample = self.project.samples.get(index)?;
                 Some((self.source_arc(sample.source)?, sample.range()))
             });
         if sample.is_some() && reference.is_none() {
@@ -1410,7 +1200,7 @@ impl App {
                 .iter()
                 .map(|entry| entry.record.source.clone()),
         );
-        if let Some(record) = &self.record {
+        if let Some(record) = &self.project.record {
             excluded.push(record.source.clone());
         }
         let local = match pool {
@@ -1507,7 +1297,7 @@ impl App {
         let Some(QueueAudio { source, clip, matched_range }) = self.queue_audio.clone() else {
             return;
         };
-        if self.output.is_none() { return; }
+        if self.audio.output().is_none() { return; }
         let duration = clip.duration();
         let seconds = self.queue_preview_seconds;
         let start = (duration * self.queue_preview_point).min((duration - seconds).max(0.0));
@@ -1650,11 +1440,11 @@ impl App {
     }
 
     pub fn suggest_cuts(&mut self) {
-        let source = self.active_source;
+        let source = self.media.active_source();
         let Some(clip) = self.source_arc(source) else {
             return;
         };
-        let span = f64::from(self.suggestion_bars) * 240.0 / f64::from(self.studio.bpm);
+        let span = f64::from(self.suggestion_bars) * 240.0 / f64::from(self.project.studio.bpm);
         let emphasis = self.suggestion_emphasis;
         self.submit_controlled("Analyzing the waveform…", move || {
             let duration = clip.duration();
@@ -1667,7 +1457,7 @@ impl App {
         let sample = self.suggestions[index].clone();
         let range = sample.range();
         self.selected_sample = None;
-        self.waveform.reveal(range, self.duration());
+        self.view.waveform.reveal(range, self.duration());
         self.set_loop_range(range);
         self.seek(range.0);
         if save {
@@ -1716,15 +1506,15 @@ impl App {
         }
         self.daw_delivery = None;
         let title = self
-            .record
+            .project.record
             .as_ref()
             .map_or_else(|| "Lost Samples Flip".into(), |record| record.title.clone());
-        let clip = self.clip.clone();
-        let mut studio = self.studio.clone();
+        let clip = self.media.root().cloned();
+        let mut studio = self.project.studio.clone();
         if self.daw_pattern_only {
             studio.sections.clear();
         }
-        let samples = self.samples.clone();
+        let samples = self.project.samples.clone();
         let options = self.daw_options;
         self.submit_controlled("Rendering DAW pack…", move || {
             Ok(Job::Delivered(crate::daw::export_with(
@@ -1763,16 +1553,16 @@ impl App {
     }
 
     fn project_frame_count(&self) -> usize {
-        self.clip.as_ref().map_or(0, |root| {
+        self.media.root().map_or(0, |root| {
             root.frames.len()
-                + root.sources.iter().take(self.studio.sources.len())
+                + root.sources.iter().take(self.project.studio.sources.len())
                     .map(|clip| clip.frames.len()).sum::<usize>()
         })
     }
 
     pub fn can_add_source(&self) -> bool {
         self.busy.is_none() && self.input_recording.is_none()
-            && self.studio.sources.len() + 1 < crate::model::MAX_SOURCES
+            && self.project.studio.sources.len() + 1 < crate::model::MAX_SOURCES
     }
 
     pub fn record_input(&mut self) {
@@ -1780,7 +1570,7 @@ impl App {
         let available = files::MAX_PROJECT_FRAMES.saturating_sub(self.project_frame_count()).min(files::MAX_PROJECT_FRAMES / 2);
         match crate::input_audio::Recording::start(self.input_device.as_deref(), available) {
             Ok((recording, monitor)) => {
-                recording.monitor(self.input_monitor && self.output.is_some());
+                recording.monitor(self.input_monitor && self.audio.output().is_some());
                 self.send(Command::InputMonitor(Some(monitor)));
                 self.input_recording = Some(recording);
                 self.status = None;
@@ -1810,7 +1600,7 @@ impl App {
     }
 
     pub fn add_source(&mut self) {
-        if self.clip.is_none() {
+        if self.media.root().is_none() {
             self.import();
             return;
         }
@@ -1835,9 +1625,9 @@ impl App {
 
     pub fn separate_stems(&mut self) {
         if !self.can_add_source() || self.recording
-            || self.studio.sources.len() + 1 + crate::separation::STEMS.len() > crate::model::MAX_SOURCES
+            || self.project.studio.sources.len() + 1 + crate::separation::STEMS.len() > crate::model::MAX_SOURCES
         { return; }
-        let Some(clip) = self.source_arc(self.active_source) else { return };
+        let Some(clip) = self.source_arc(self.media.active_source()) else { return };
         let range = self.selection().unwrap_or((0.0, clip.duration()));
         let program = self.demucs_path.clone();
         let remaining = files::MAX_PROJECT_FRAMES.saturating_sub(self.project_frame_count());
@@ -1858,19 +1648,19 @@ impl App {
             .set_file_name("drums.flipkit").save_file()
         else { return };
         let mut kit = Studio {
-            kit: self.studio.kit,
-            drum_mix: self.studio.drum_mix,
-            filter: self.studio.filter,
-            reverb: self.studio.reverb,
-            delay: self.studio.delay,
-            delay_division: self.studio.delay_division,
-            drum_fx_bypass: self.studio.drum_fx_bypass,
+            kit: self.project.studio.kit,
+            drum_mix: self.project.studio.drum_mix,
+            filter: self.project.studio.filter,
+            reverb: self.project.studio.reverb,
+            delay: self.project.studio.delay,
+            delay_division: self.project.studio.delay_division,
+            drum_fx_bypass: self.project.studio.drum_fx_bypass,
             ..Studio::default()
         };
         let mut source_map = HashMap::new();
-        kit.choke_groups.drums = self.studio.choke_groups.drums;
+        kit.choke_groups.drums = self.project.studio.choke_groups.drums;
         let mut sources = Vec::new();
-        for (lane, source) in self.studio.drum_sources.into_iter().enumerate() {
+        for (lane, source) in self.project.studio.drum_sources.into_iter().enumerate() {
             let Some(source) = source else { continue };
             let (Some(record), Some(clip)) = (self.source_record(source), self.source_arc(source)) else { continue };
             let index = *source_map.entry(source).or_insert_with(|| {
@@ -1913,8 +1703,8 @@ impl App {
 
     fn apply_drum_kit(&mut self, project: Project, audio: Option<Clip>) {
         let Project { record, studio: kit, .. } = project;
-        let offset = self.clip.as_ref().map_or(0, |_| self.studio.sources.len() + 1);
-        if let Some(mut first) = audio {
+        let offset = self.media.root().map_or(0, |_| self.project.studio.sources.len() + 1);
+        if let Some(first) = audio {
             let Some(record) = record else {
                 self.status = Some(("The kit is missing its first drum source.".into(), true));
                 return;
@@ -1927,33 +1717,26 @@ impl App {
                 return;
             }
             self.stop_all();
-            let sources = std::mem::take(&mut first.sources);
-            if let Some(root) = &mut self.clip {
-                let root = Arc::make_mut(root);
-                root.sources.truncate(offset - 1);
-                root.sources.push(Arc::new(first));
-                root.sources.extend(sources);
-                self.studio.sources.push(record);
+            if self.media.append(first, self.project.studio.sources.len()) == 0 {
+                self.project.record = Some(record);
             } else {
-                first.sources = sources;
-                self.clip = Some(Arc::new(first));
-                self.record = Some(record);
+                self.project.studio.sources.push(record);
             }
-            self.studio.sources.extend(kit.sources);
-            self.samples_in_project = true;
-            self.send(Command::Clip(self.clip.clone()));
-            self.send(Command::PreviewSource(self.active_source));
+            self.project.studio.sources.extend(kit.sources);
+            self.session.samples_in_project = true;
+            self.send(Command::Clip(self.media.root().cloned()));
+            self.send(Command::PreviewSource(self.media.active_source()));
             self.seek(self.position);
         }
-        self.studio.kit = kit.kit;
-        self.studio.drum_sources = kit.drum_sources.map(|source| source.map(|index| index + offset));
-        self.studio.drum_mix = kit.drum_mix;
-        self.studio.choke_groups.drums = kit.choke_groups.drums;
-        self.studio.filter = kit.filter;
-        self.studio.reverb = kit.reverb;
-        self.studio.delay = kit.delay;
-        self.studio.delay_division = kit.delay_division;
-        self.studio.drum_fx_bypass = kit.drum_fx_bypass;
+        self.project.studio.kit = kit.kit;
+        self.project.studio.drum_sources = kit.drum_sources.map(|source| source.map(|index| index + offset));
+        self.project.studio.drum_mix = kit.drum_mix;
+        self.project.studio.choke_groups.drums = kit.choke_groups.drums;
+        self.project.studio.filter = kit.filter;
+        self.project.studio.reverb = kit.reverb;
+        self.project.studio.delay = kit.delay;
+        self.project.studio.delay_division = kit.delay_division;
+        self.project.studio.drum_fx_bypass = kit.drum_fx_bypass;
         self.status = Some(("Drum kit applied.".into(), false));
     }
 
@@ -1961,23 +1744,23 @@ impl App {
         if !self.can_add_source() || self.recording {
             return;
         }
-        let Some(pad) = self.studio.pads.iter().position(Option::is_none) else { return };
+        let Some(pad) = self.project.studio.pads.iter().position(Option::is_none) else { return };
         self.read_recorded_chops();
         self.sync();
         let sequence = if song {
-            let Some(sequence) = self.studio.song_sequence() else { return };
+            let Some(sequence) = self.project.studio.song_sequence() else { return };
             sequence
         } else {
-            if !self.studio.has_pattern() && self.studio.active_loop().is_none() {
+            if !self.project.studio.has_pattern() && self.project.studio.active_loop().is_none() {
                 return;
             }
-            self.studio.active_sequence()
+            self.project.studio.active_sequence()
         };
-        let studio = self.studio.clone();
-        let clip = self.clip.clone();
+        let studio = self.project.studio.clone();
+        let clip = self.media.root().cloned();
         let remaining = files::MAX_PROJECT_FRAMES.saturating_sub(self.project_frame_count());
         let record = Record {
-            title: format!("Bounce {:02}", self.studio.sources.len() + 1),
+            title: format!("Bounce {:02}", self.project.studio.sources.len() + 1),
             artist: "Project audio".into(),
             genre: String::new(),
             source: Source::Generated(self.random()),
@@ -1991,14 +1774,14 @@ impl App {
 
     pub fn resample_selected_pad(&mut self) {
         if !self.can_add_source() || self.recording { return; }
-        let Some(destination) = self.studio.pads.iter().position(Option::is_none) else { return };
+        let Some(destination) = self.project.studio.pads.iter().position(Option::is_none) else { return };
         let pad = self.selected_pad;
         if self.pad_range(pad).is_none() { return; }
-        let Some(clip) = self.clip.clone() else { return };
-        let Some(source) = clip.source(self.studio.pad_sources[pad]) else { return };
+        let Some(clip) = self.media.root().cloned() else { return };
+        let Some(source) = clip.source(self.project.studio.pad_sources[pad]) else { return };
         let rate = source.rate;
         let remaining = files::MAX_PROJECT_FRAMES.saturating_sub(self.project_frame_count());
-        let studio = self.studio.clone();
+        let studio = self.project.studio.clone();
         let record = Record {
             title: format!("Processed pad {:02}", pad + 1),
             artist: "Project audio".into(),
@@ -2044,7 +1827,7 @@ impl App {
     }
 
     pub fn export_region(&mut self, range: (f64, f64), filename: &str) {
-        self.export_source_region(self.active_source, range, filename);
+        self.export_source_region(self.media.active_source(), range, filename);
     }
 
     pub fn export_cut(&mut self, pad: bool, processed: bool, options: files::WavOptions) {
@@ -2052,16 +1835,16 @@ impl App {
         let (range, source, controls, name) = if pad {
             let pad = self.selected_pad;
             let Some(range) = self.pad_range(pad) else { return };
-            (range, self.studio.pad_sources[pad], self.studio.pad_controls[pad], format!("pad-{:02}.wav", pad + 1))
+            (range, self.project.studio.pad_sources[pad], self.project.studio.pad_controls[pad], format!("pad-{:02}.wav", pad + 1))
         } else {
             let Some(range) = self.selection() else { return };
-            (range, self.active_source, SampleControls::default(), "selection.wav".into())
+            (range, self.media.active_source(), SampleControls::default(), "selection.wav".into())
         };
         let Some(clip) = self.source_arc(source) else { return };
         let Some(path) = rfd::FileDialog::new().add_filter("WAV", &["wav"]).set_file_name(name).save_file()
         else { return };
-        let controls = processed.then_some((controls, self.studio.speed));
-        let processed_pad = (pad && processed).then(|| (self.studio.clone(), self.clip.clone(), self.selected_pad));
+        let controls = processed.then_some((controls, self.project.studio.speed));
+        let processed_pad = (pad && processed).then(|| (self.project.studio.clone(), self.media.root().cloned(), self.selected_pad));
         self.submit_controlled("Exporting cut…", move || {
             files::publish_export(&path, |output| {
                 if let Some((studio, Some(root), index)) = &processed_pad {
@@ -2081,8 +1864,8 @@ impl App {
         }
         self.read_recorded_chops();
         self.sync();
-        let studio = self.studio.clone();
-        let clip = self.clip.clone();
+        let studio = self.project.studio.clone();
+        let clip = self.media.root().cloned();
         self.submit_controlled("Preparing drag WAV…", move || {
             use crate::platform::drag_export;
             let path = drag_export::prepare(&drag_export::directory()?, kind, studio.clone(), clip.clone(), options)?;
@@ -2123,42 +1906,42 @@ impl App {
         let Some((start, end)) = self.selection() else {
             return;
         };
-        if self.samples.len() >= MAX_NAMED_SAMPLES {
+        if self.project.samples.len() >= MAX_NAMED_SAMPLES {
             return;
         }
         let name = self.sample_name.trim();
         let name = if name.is_empty() {
-            format!("Sample {}", self.samples.len() + 1)
+            format!("Sample {}", self.project.samples.len() + 1)
         } else {
             name.to_owned()
         };
-        self.samples.push(NamedSample { source: self.active_source, name, start, end });
-        self.selected_sample = Some(self.samples.len() - 1);
+        self.project.samples.push(NamedSample { source: self.media.active_source(), name, start, end });
+        self.selected_sample = Some(self.project.samples.len() - 1);
         self.sample_name.clear();
         self.persist_samples();
     }
 
     pub fn recall_sample(&mut self, index: usize) {
-        let range = self.samples[index].range();
-        self.select_source(self.samples[index].source);
+        let range = self.project.samples[index].range();
+        self.select_source(self.project.samples[index].source);
         self.selected_sample = Some(index);
-        self.waveform.reveal(range, self.duration());
+        self.view.waveform.reveal(range, self.duration());
         self.set_loop_range(range);
         self.seek(range.0);
     }
 
     pub fn set_loop_range(&mut self, (start, end): (f64, f64)) {
-        if self.studio.loop_source != self.active_source {
-            self.studio.looping = false;
+        if self.project.studio.loop_source != self.media.active_source() {
+            self.project.studio.looping = false;
         }
-        self.studio.loop_source = self.active_source;
-        self.studio.loop_in = Some(start);
-        self.studio.loop_out = Some(end);
+        self.project.studio.loop_source = self.media.active_source();
+        self.project.studio.loop_in = Some(start);
+        self.project.studio.loop_out = Some(end);
         self.sync();
     }
 
     pub fn audition_range(&mut self, (start, end): (f64, f64)) {
-        if self.playing || self.output.is_none() {
+        if self.playing || self.audio.output().is_none() {
             return;
         }
         self.stop_listening();
@@ -2170,20 +1953,20 @@ impl App {
 
     pub fn update_sample(&mut self, index: usize) {
         if let Some((start, end)) = self.selection() {
-            self.samples[index].source = self.active_source;
-            self.samples[index].start = start;
-            self.samples[index].end = end;
+            self.project.samples[index].source = self.media.active_source();
+            self.project.samples[index].start = start;
+            self.project.samples[index].end = end;
             self.persist_samples();
         }
     }
 
     pub fn rename_sample(&mut self, index: usize, name: String) {
-        self.samples[index].name = name;
+        self.project.samples[index].name = name;
         self.persist_samples();
     }
 
     pub fn remove_sample(&mut self, index: usize) {
-        self.samples.remove(index);
+        self.project.samples.remove(index);
         self.selected_sample = self
             .selected_sample
             .filter(|&selected| selected != index)
@@ -2193,7 +1976,7 @@ impl App {
     }
 
     pub fn export_sample(&mut self, index: usize) {
-        let sample = &self.samples[index];
+        let sample = &self.project.samples[index];
         let name = sample
             .name
             .replace(|c: char| c.is_control() || "<>:\"/\\|?*".contains(c), "_");
@@ -2204,7 +1987,7 @@ impl App {
         for (number, &index) in indices.iter().enumerate() {
             let suffix = format!(" {:02}", number + 1);
             let prefix: String = prefix.chars().take(crate::model::MAX_SAMPLE_NAME - suffix.len()).collect();
-            self.samples[index].name = format!("{prefix}{suffix}");
+            self.project.samples[index].name = format!("{prefix}{suffix}");
         }
         self.persist_samples();
     }
@@ -2214,7 +1997,7 @@ impl App {
             return;
         }
         let cuts: Vec<_> = indices.iter().filter_map(|&index| {
-            let sample = self.samples.get(index)?;
+            let sample = self.project.samples.get(index)?;
             let clip = self.source_arc(sample.source)?;
             let name: String = sample.name.chars().map(|c| {
                 if c.is_control() || ['<', '>', ':', '"', '/', '\\', '|', '?', '*'].contains(&c) {
@@ -2243,18 +2026,18 @@ impl App {
     }
 
     fn persist_samples(&mut self) {
-        if self.samples_in_project {
+        if self.session.samples_in_project {
             return;
         }
-        if let Some(record) = &self.record {
+        if let Some(record) = &self.project.record {
             let source = record.source.clone();
             self.library
                 .sample_banks
                 .retain(|bank| bank.source != source);
-            if !self.samples.is_empty() {
+            if !self.project.samples.is_empty() {
                 self.library.sample_banks.push(SampleBank {
                     source,
-                    samples: self.samples.clone(),
+                    samples: self.project.samples.clone(),
                 });
             }
             self.persist_library();
@@ -2262,8 +2045,8 @@ impl App {
     }
 
     pub fn audition_tempo(&mut self, bpm: u16) {
-        if self.playing || self.output.is_none() { return; }
-        let Some(clip) = self.source_arc(self.active_source) else { return };
+        if self.playing || self.audio.output().is_none() { return; }
+        let Some(clip) = self.source_arc(self.media.active_source()) else { return };
         let range = self.selection().filter(|(start, end)| end - start >= 6.0)
             .unwrap_or((0.0, clip.duration()));
         let beat = 60.0 / f64::from(bpm);
@@ -2275,7 +2058,7 @@ impl App {
     }
 
     pub fn estimate_tempo(&mut self) {
-        let source = self.active_source;
+        let source = self.media.active_source();
         let Some(clip) = self.source_arc(source) else {
             return;
         };
@@ -2317,45 +2100,22 @@ impl App {
         }
     }
 
-    fn project_snapshot(&self) -> Project {
-        Project {
-            record: self.record.clone(),
-            studio: self.studio.clone(),
-            samples: self.samples.clone(),
-            source_ids: self.source_ids.clone(),
-            snapshots: self.snapshots.clone(),
-        }
-    }
-
-    fn sync_source_ids(&mut self) {
-        use crate::model::snapshot::SourceId;
-        let count = self.clip.as_ref().map_or(0, |_| self.studio.sources.len() + 1);
-        self.source_ids.truncate(count);
-        while self.source_ids.len() < count {
-            let id = SourceId(self.next_source_id);
-            self.next_source_id = self.next_source_id.wrapping_add(1).max(1);
-            if !self.source_ids.contains(&id) {
-                self.source_ids.push(id);
-            }
-        }
-    }
-
     pub fn save_named_snapshot(&mut self, name: &str) -> files::Result<()> {
         use crate::model::snapshot::{MAX_SNAPSHOT_BYTES, MAX_SNAPSHOTS, NamedSnapshot};
         let name: String = name.trim().chars().take(crate::model::MAX_SAMPLE_NAME).collect();
-        if self.recording || name.is_empty() || self.snapshots.iter().any(|item| item.name.eq_ignore_ascii_case(&name)) {
+        if self.recording || name.is_empty() || self.project.snapshots.iter().any(|item| item.name.eq_ignore_ascii_case(&name)) {
             return Err("Use a unique snapshot name with recording stopped.".into());
         }
-        if self.snapshots.len() >= MAX_SNAPSHOTS {
+        if self.project.snapshots.len() >= MAX_SNAPSHOTS {
             return Err("Delete a snapshot to make room for another.".into());
         }
         self.observe_edits(false);
         let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
-        let previous_ids = self.source_ids.clone();
+        let previous_ids = self.project.source_ids.clone();
         self.sync_source_ids();
-        let mut project = self.project_snapshot();
+        let mut project = self.project.clone();
         Arc::make_mut(&mut project.snapshots).push(NamedSnapshot::new(
-            name, timestamp, self.source_ids.clone(), self.studio.clone(), self.samples.clone(),
+            name, timestamp, self.project.source_ids.clone(), self.project.studio.clone(), self.project.samples.clone(),
         ));
         let sizes = serde_json::to_vec(&project.snapshots).and_then(|snapshots| {
             serde_json::to_vec(&project).map(|metadata| (snapshots.len(), metadata.len()))
@@ -2364,31 +2124,29 @@ impl App {
             snapshots <= MAX_SNAPSHOT_BYTES && metadata <= files::MAX_PROJECT_METADATA
         });
         if !fits {
-            self.source_ids = previous_ids;
+            self.project.source_ids = previous_ids;
             return Err("This snapshot would exceed the project metadata limit.".into());
         }
-        self.snapshots = project.snapshots;
+        self.project.snapshots = project.snapshots;
         self.observe_edits(false);
         Ok(())
     }
 
     pub fn delete_named_snapshot(&mut self, index: usize) {
-        if index < self.snapshots.len() && !self.recording {
+        if index < self.project.snapshots.len() && !self.recording {
             self.observe_edits(false);
-            Arc::make_mut(&mut self.snapshots).remove(index);
+            Arc::make_mut(&mut self.project.snapshots).remove(index);
             self.observe_edits(false);
         }
     }
 
     fn resolve_snapshot(&self, index: usize) -> Option<(Studio, Vec<NamedSample>)> {
-        let (mut studio, mut samples) = self.snapshots.get(index)?
-            .resolve(&self.studio.sources, &self.source_ids)?;
-        studio.validate_media(self.clip.as_deref());
-        studio.validate_source_analysis(self.clip.as_deref());
+        let (mut studio, mut samples) = self.project.snapshots.get(index)?
+            .resolve(&self.project.studio.sources, &self.project.source_ids)?;
+        studio.validate_media(self.media.root_clip());
+        studio.validate_source_analysis(self.media.root_clip());
         studio.validate_song();
-        NamedSample::validate_sources(&mut samples, |source| {
-            self.clip.as_deref()?.source(source).map(Clip::duration)
-        });
+        NamedSample::validate_sources(&mut samples, |source| self.source_clip(source).map(Clip::duration));
         Some((studio, samples))
     }
 
@@ -2399,14 +2157,14 @@ impl App {
         let Some((mut studio, samples)) = self.resolve_snapshot(index) else { return false };
         self.observe_edits(false);
         self.stop_all();
-        studio.event_id_next = studio.event_id_next.max(self.studio.event_id_next);
+        studio.event_id_next = studio.event_id_next.max(self.project.studio.event_id_next);
         studio.identify_saved_events();
-        self.studio = studio;
-        self.samples = samples;
-        self.samples_in_project = true;
+        self.view.arrangement_timeline.restore_sections(&self.project.studio.sections, &studio.sections);
+        self.project.studio = studio;
+        self.project.samples = samples;
+        self.session.samples_in_project = true;
         self.reset_pattern_editor();
-        self.arrangement_timeline.sections_changed();
-        self.select_source(self.studio.loop_source);
+        self.select_source(self.project.studio.loop_source);
         self.observe_edits(false);
         self.status = Some(("Snapshot restored.".into(), false));
         true
@@ -2415,12 +2173,12 @@ impl App {
     pub fn prepare_snapshot_preview(
         &mut self, index: usize, song: bool, start: usize, match_level: bool,
     ) -> files::Result<()> {
-        if self.busy.is_some() || self.input_recording.is_some() || self.recording || self.output.is_none() {
+        if self.busy.is_some() || self.input_recording.is_some() || self.recording || self.audio.output().is_none() {
             return Err("Finish the current operation before preparing a comparison.".into());
         }
         self.sync();
         let (saved, _) = self.resolve_snapshot(index).ok_or("The snapshot's sources are unavailable.")?;
-        let current = self.studio.clone();
+        let current = self.project.studio.clone();
         let sequence = |studio: &Studio| {
             if song { studio.song_sequence() } else { Some(studio.active_sequence()) }
         };
@@ -2433,7 +2191,7 @@ impl App {
         self.clear_snapshot_preview();
         let request = self.random();
         self.snapshot_preview_request = Some(request);
-        let clip = self.clip.clone();
+        let clip = self.media.root().cloned();
         self.submit_controlled(SNAPSHOT_PREVIEW_JOB, move || {
             let render = |studio: Studio, sequence| {
                 files::bounce_window(studio, clip.clone(), sequence, Some(start..end), files::MAX_PROJECT_FRAMES)
@@ -2486,20 +2244,6 @@ impl App {
         }
         if self.retry_job.as_ref().is_some_and(|(name, _)| *name == SNAPSHOT_PREVIEW_JOB) {
             self.retry_job = None;
-        }
-    }
-
-    pub(crate) fn observe_edits(&mut self, group: bool) {
-        self.sync();
-        let current = &self.session.current;
-        if current.studio != self.studio || current.samples != self.samples || current.record != self.record
-            || current.source_ids != self.source_ids || !Arc::ptr_eq(&current.snapshots, &self.snapshots)
-        {
-            self.clear_snapshot_preview();
-            self.analysis_invalidate();
-            self.session.observe(self.project_snapshot(), group);
-        } else if !group {
-            self.session.end_group();
         }
     }
 
@@ -2588,7 +2332,7 @@ impl App {
         self.read_recorded_chops();
         self.observe_edits(self.recording);
         let snapshot = self.session.current.clone();
-        let clip = self.clip.clone();
+        let clip = self.media.root().cloned();
         self.submit_controlled("Saving project template…", move || {
             files::publish_export(&path, |output| files::save_project(output, &snapshot, clip.as_deref()))?;
             Ok(Job::Wrote(format!("Saved template {}", path.display())))
@@ -2619,56 +2363,11 @@ impl App {
         self.read_recorded_chops();
         self.observe_edits(self.recording);
         let snapshot = self.session.current.clone();
-        let clip = self.clip.clone();
+        let clip = self.media.root().cloned();
         self.submit_controlled("Saving project…", move || {
             files::publish_export(&path, |output| files::save_project(output, &snapshot, clip.as_deref()))?;
             Ok(Job::Saved(path, snapshot))
         });
-    }
-
-    pub fn can_undo_project(&self, redo: bool) -> bool {
-        !self.recording && self.pending_change.is_none() && self.session.can_travel(redo)
-    }
-
-    pub fn undo_project(&mut self, redo: bool) {
-        if !self.can_undo_project(redo) {
-            return;
-        }
-        let Some(snapshot) = self.session.travel(redo) else { return };
-        self.analysis_invalidate();
-        self.recording_project += 1;
-        self.recorded_gates.clear();
-        self.stop_song();
-        self.studio = snapshot.studio.clone();
-        self.source_ids.clone_from(&snapshot.source_ids);
-        self.snapshots = snapshot.snapshots.clone();
-        self.clear_snapshot_preview();
-        if self.record.is_some() && snapshot.record.is_none() {
-            self.stop_all();
-            self.detached_clip = self.clip.take();
-            self.send(Command::Clip(None));
-            self.position = 0.0;
-        } else if self.record.is_none() && snapshot.record.is_some() {
-            self.clip = self.detached_clip.take();
-            self.send(Command::Clip(self.clip.clone()));
-        }
-        self.record = snapshot.record.clone();
-        if self.active_source > self.studio.sources.len() {
-            self.select_source(0);
-        }
-        if let Some(roll) = self.piano_roll.as_mut() {
-            roll.reset_selection();
-        }
-        let samples_changed = self.samples != snapshot.samples;
-        self.samples = snapshot.samples.clone();
-        self.selected_sample = None;
-        self.sample_rename = None;
-        self.bar = self.bar.min(self.studio.bars - 1);
-        self.arrangement_timeline.sections_changed();
-        if samples_changed {
-            self.persist_samples();
-        }
-        self.sync();
     }
 
     fn continue_change(&mut self, discard: bool) {
@@ -2787,8 +2486,8 @@ impl App {
             return;
         }
         let filename = match extension {
-            "wav" if !pattern_only && !self.studio.sections.is_empty() => "song.wav",
-            "mid" if !pattern_only && !self.studio.sections.is_empty() => "song.mid",
+            "wav" if !pattern_only && !self.project.studio.sections.is_empty() => "song.wav",
+            "mid" if !pattern_only && !self.project.studio.sections.is_empty() => "song.mid",
             "wav" => "flip.wav",
             "mid" => "flip.mid",
             "csv" => "crate.csv",
@@ -2806,11 +2505,11 @@ impl App {
         self.sync();
         match extension {
             "wav" | "mid" => {
-                let mut studio = self.studio.clone();
+                let mut studio = self.project.studio.clone();
                 if pattern_only {
                     studio.sections.clear();
                 }
-                let clip = self.clip.clone();
+                let clip = self.media.root().cloned();
                 let wav = extension == "wav";
                 let task = if studio.sections.is_empty() {
                     "Exporting pattern…"
@@ -2882,7 +2581,7 @@ impl App {
     }
 
     pub fn is_saved(&self) -> bool {
-        self.record.as_ref().is_some_and(|record| {
+        self.project.record.as_ref().is_some_and(|record| {
             self.library
                 .records
                 .iter()
@@ -2893,13 +2592,13 @@ impl App {
     pub fn save_record(&mut self) {
         self.read_recorded_chops();
         self.sync();
-        if !self.studio.sources.is_empty()
-            || self.record.as_ref().is_some_and(|record| matches!(record.source, Source::Generated(_) | Source::Extracted(_)))
+        if !self.project.studio.sources.is_empty()
+            || self.project.record.as_ref().is_some_and(|record| matches!(record.source, Source::Generated(_) | Source::Extracted(_)))
         {
             self.status = Some(("Save the project to keep its embedded sources.".into(), false));
             return;
         }
-        if let Some(record) = &self.record {
+        if let Some(record) = &self.project.record {
             let saved = self
                 .library
                 .records
@@ -2907,14 +2606,14 @@ impl App {
                 .find(|entry| entry.record.source == record.source);
             let mut entry = saved.cloned().unwrap_or_else(|| SavedRecord {
                 record: record.clone(),
-                studio: self.studio.clone(),
+                studio: self.project.studio.clone(),
                 collection: None,
                 other_collections: Vec::new(),
                 tags: String::new(),
                 notes: String::new(),
                 favorite: false,
             });
-            entry.studio = self.studio.clone();
+            entry.studio = self.project.studio.clone();
             if let Some(collection) = self.collection.as_deref() && !entry.in_collection(Some(collection)) {
                 entry.toggle_collection(collection);
             }
@@ -2995,8 +2694,7 @@ impl App {
 
     pub fn seek(&mut self, seconds: f64) {
         self.position = seconds.clamp(0.0, self.duration());
-        self.seeked_at = Some(Instant::now());
-        self.send(Command::Seek(self.position));
+        self.audio.seek(self.position);
     }
 
     pub fn jump(&mut self) {
@@ -3005,7 +2703,7 @@ impl App {
     }
 
     pub fn toggle_preview(&mut self) {
-        if self.clip.is_some() && self.output.is_some() {
+        if self.media.root().is_some() && self.audio.output().is_some() {
             self.stop_listening();
             self.preview = !self.preview;
             self.sync();
@@ -3014,7 +2712,7 @@ impl App {
     }
 
     pub fn can_preview_drum_template(&self) -> bool {
-        self.busy.is_none() && self.output.is_some() && !self.playing
+        self.busy.is_none() && self.audio.output().is_some() && !self.playing
             && !self.recording && self.input_recording.is_none()
     }
 
@@ -3034,7 +2732,7 @@ impl App {
             return;
         }
         let template = &crate::model::drum_templates::TEMPLATES[index];
-        let mut studio = self.studio.clone();
+        let mut studio = self.project.studio.clone();
         studio.looping = false;
         if use_groove {
             studio.bpm = template.bpm;
@@ -3048,7 +2746,7 @@ impl App {
             bars,
             ..Default::default()
         };
-        let clip = self.clip.clone();
+        let clip = self.media.root().cloned();
         self.submit_controlled(DRUM_PREVIEW_JOB, move || {
             let preview = files::bounce_mix(studio, clip, sequence, files::MAX_PROJECT_FRAMES)?;
             Ok(Job::DrumTemplatePreview(index, use_groove, preview))
@@ -3088,7 +2786,7 @@ impl App {
         }
         self.scene_active = None;
         self.scene_pending = None;
-        if self.output.is_some() {
+        if self.audio.output().is_some() {
             self.playing = playing;
             self.song_playing = None;
             self.sync();
@@ -3098,14 +2796,14 @@ impl App {
     }
 
     pub fn can_launch_scene(&self) -> bool {
-        self.output.is_some() && self.song_playing.is_none() && !self.recording
+        self.audio.output().is_some() && self.song_playing.is_none() && !self.recording
             && self.midi_clock_connection.is_none()
     }
 
     pub fn launch_scene(&mut self, index: usize) {
         if !self.can_launch_scene() { return; }
         self.sync();
-        let Some(pattern) = self.studio.patterns.get(index) else { return };
+        let Some(pattern) = self.project.studio.patterns.get(index) else { return };
         let mut sequence = pattern.notes.clone();
         sequence.bars.resize(pattern.length, Default::default());
         sequence.performance.retain(|note| note.tick < pattern.length as u32 * crate::model::TICKS_PER_BAR);
@@ -3116,14 +2814,14 @@ impl App {
 
     fn capture_scene_bar(&mut self, pattern: usize, offset: usize) {
         if !self.scene_capture { return; }
-        let Some(scene) = self.studio.patterns.get(pattern) else { return };
-        let available = crate::model::MAX_SONG_BARS.saturating_sub(self.studio.song_bars());
+        let Some(scene) = self.project.studio.patterns.get(pattern) else { return };
+        let available = crate::model::MAX_SONG_BARS.saturating_sub(self.project.studio.song_bars());
         if self.scene_take.iter().map(|run| run.bars).sum::<usize>() >= available { return; }
         if let Some(run) = self.scene_take.last_mut()
             && run.pattern == pattern && (run.offset + run.bars) % scene.length == offset
         {
             run.bars += 1;
-        } else if self.scene_take.len() + self.studio.sections.len() < crate::model::MAX_SECTIONS {
+        } else if self.scene_take.len() + self.project.studio.sections.len() < crate::model::MAX_SECTIONS {
             self.scene_take.push(SceneRun { pattern, offset, bars: 1 });
         }
     }
@@ -3131,21 +2829,21 @@ impl App {
     pub fn append_scene_take(&mut self) {
         self.read_recorded_chops();
         self.scene_capture = false;
-        let mut remaining = crate::model::MAX_SONG_BARS.saturating_sub(self.studio.song_bars());
-        let space = crate::model::MAX_SECTIONS.saturating_sub(self.studio.sections.len());
+        let mut remaining = crate::model::MAX_SONG_BARS.saturating_sub(self.project.studio.song_bars());
+        let space = crate::model::MAX_SECTIONS.saturating_sub(self.project.studio.sections.len());
         for run in self.scene_take.drain(..).take(space) {
             let bars = run.bars.min(remaining);
             if bars == 0 { break; }
-            if self.studio.patterns.get(run.pattern).is_none() { continue; }
+            if self.project.studio.patterns.get(run.pattern).is_none() { continue; }
             let mut section = crate::model::Section::new(crate::model::SectionKind::Verse, run.pattern, 1);
             section.span = Some(crate::model::SectionSpan { offset: run.offset, bars });
-            self.studio.sections.push(section);
+            self.project.studio.sections.push(section);
             remaining -= bars;
         }
     }
 
     pub fn update_playing_automation(&self) {
-        if let Some(id) = self.song_playing && let Some(sequence) = self.studio.song_sequence() {
+        if let Some(id) = self.song_playing && let Some(sequence) = self.project.studio.song_sequence() {
             self.send(Command::SongAutomation(id, Arc::new(sequence)));
         }
     }
@@ -3155,29 +2853,29 @@ impl App {
     }
 
     pub fn can_play_section(&self) -> bool {
-        self.output.is_some() && !self.recording && self.midi_clock_connection.is_none()
+        self.audio.output().is_some() && !self.recording && self.midi_clock_connection.is_none()
     }
 
     pub fn play_section(&mut self, index: usize, repeat: bool) {
         if !self.can_play_section() {
             return;
         }
-        let Some(range) = self.studio.section_range(index) else { return };
+        let Some(range) = self.project.studio.section_range(index) else { return };
         let start = (range.start / crate::model::TICKS_PER_BAR) as usize;
         let end = if repeat {
             (range.end / crate::model::TICKS_PER_BAR) as usize
         } else {
-            self.studio.song_bars()
+            self.project.studio.song_bars()
         };
         self.start_song(Some((start..end, repeat)));
     }
 
     fn start_song(&mut self, window: Option<(std::ops::Range<usize>, bool)>) {
-        if self.output.is_none() || self.recording {
+        if self.audio.output().is_none() || self.recording {
             return;
         }
         self.sync();
-        let Some(sequence) = self.studio.song_sequence() else {
+        let Some(sequence) = self.project.studio.song_sequence() else {
             return;
         };
         self.stop_listening();
@@ -3203,28 +2901,28 @@ impl App {
     }
 
     pub fn open_commands(&mut self) {
-        self.command_query.clear();
-        self.focus_commands = true;
-        self.show_commands = true;
+        self.view.commands.query.clear();
+        self.view.commands.focus = true;
+        self.view.commands.open = true;
     }
 
     pub fn open_arrangement(&mut self) {
         if self.pattern_name.trim().is_empty() {
-            self.pattern_name = self.studio.next_pattern_name();
+            self.pattern_name = self.project.studio.next_pattern_name();
         }
-        self.arrangement_timeline.cancel_drag();
-        self.studio_view = StudioView::Arrange;
+        self.view.arrangement_timeline.cancel_drag();
+        self.view.studio_view = StudioView::Arrange;
     }
 
     pub fn create_pattern(&mut self, blank: bool) {
         self.read_recorded_chops();
         let name = self.pattern_name.trim().to_owned();
-        let save_draft = blank && self.studio.has_draft();
+        let save_draft = blank && self.project.studio.has_draft();
         if self.recording
             || name.is_empty()
-            || self.studio.patterns.len() + usize::from(save_draft) >= MAX_PATTERNS
+            || self.project.studio.patterns.len() + usize::from(save_draft) >= MAX_PATTERNS
             || self
-                .studio
+                .project.studio
                 .patterns
                 .iter()
                 .any(|pattern| pattern.name.eq_ignore_ascii_case(&name))
@@ -3235,58 +2933,55 @@ impl App {
         self.read_recorded_chops();
         self.sync();
         if save_draft {
-            let draft = self.studio.next_pattern_name_except(&name);
-            self.studio.save_pattern(&draft, false);
+            let draft = self.project.studio.next_pattern_name_except(&name);
+            self.project.studio.save_pattern(&draft, false);
         }
-        self.studio.save_pattern(&name, blank);
-        self.pattern_name = self.studio.next_pattern_name();
+        self.project.studio.save_pattern(&name, blank);
+        self.pattern_name = self.project.studio.next_pattern_name();
         self.reset_pattern_editor();
     }
 
     pub fn preview_performance(&mut self, bars: usize) {
         self.sync();
         self.capture_quantize = Quantize::Off;
-        if let Some(output) = &self.output {
+        if let Some(output) = self.audio.output() {
             let request = output.performance.invalidate_preview();
             output.send(Command::PreviewPerformance(bars, request));
         }
     }
 
     pub fn keep_performance(&mut self) {
-        if self.recording || !self.sent.same_capture_instruments(&self.studio) {
+        if self.recording || !self.audio.capture_matches(&self.project.studio) {
             return;
         }
-        let save_draft = self.studio.has_draft();
-        if self.studio.patterns.len() + usize::from(save_draft) >= MAX_PATTERNS {
+        let save_draft = self.project.studio.has_draft();
+        if self.project.studio.patterns.len() + usize::from(save_draft) >= MAX_PATTERNS {
             self.status = Some(("Remove an unused pattern to make room for the capture.".into(), true));
             return;
         }
-        if let Some(output) = &mut self.output {
-            output.performance.poll();
-            output.retire_settings();
-        }
-        let Some(preview) = self.output.as_ref().and_then(|output| output.performance.preview())
+        self.audio.poll();
+        let Some(preview) = self.audio.output().and_then(|output| output.performance.preview())
         else {
             return;
         };
-        let notes = preview.notes(self.capture_quantize, self.studio.swing);
+        let notes = preview.notes(self.capture_quantize, self.project.studio.swing);
         let bars = preview.bars;
         self.observe_edits(false);
-        let mut next = self.project_snapshot();
+        let mut next = self.project.clone();
         let Some(name) = next.studio.save_captured_pattern(bars, notes) else { return };
         if !serde_json::to_vec(&next).is_ok_and(|bytes| bytes.len() <= files::MAX_PROJECT_METADATA) {
             self.status = Some(("Choose a shorter capture to stay within the project size limit.".into(), true));
             return;
         }
-        if let Some(output) = &self.output {
+        if let Some(output) = self.audio.output() {
             output.performance.invalidate_preview();
         }
-        self.studio = next.studio;
+        self.project.studio = next.studio;
         self.set_playing(false);
         self.midi_panic();
-        self.pattern_name = self.studio.next_pattern_name();
+        self.pattern_name = self.project.studio.next_pattern_name();
         self.reset_pattern_editor();
-        self.studio_view = StudioView::Sequence;
+        self.view.studio_view = StudioView::Sequence;
         self.observe_edits(false);
         self.status = Some((format!("Saved {name} as a new pattern."), false));
     }
@@ -3308,14 +3003,14 @@ impl App {
 
     pub fn keep_variation(&mut self, name: &str, sequence: crate::model::Sequence) -> bool {
         self.observe_edits(false);
-        let mut next = self.project_snapshot();
+        let mut next = self.project.clone();
         let Some(name) = next.studio.save_generated_pattern(name, sequence) else {
             return false;
         };
         if !serde_json::to_vec(&next).is_ok_and(|bytes| bytes.len() <= files::MAX_PROJECT_METADATA) {
             return false;
         }
-        self.studio = next.studio;
+        self.project.studio = next.studio;
         self.stop_all();
         self.reset_pattern_editor();
         self.observe_edits(false);
@@ -3325,32 +3020,32 @@ impl App {
 
     pub fn edit_pattern(&mut self, index: usize) {
         if self.recording
-            || index >= self.studio.patterns.len()
-            || self.studio.editing_pattern == Some(index)
+            || index >= self.project.studio.patterns.len()
+            || self.project.studio.editing_pattern == Some(index)
         {
             return;
         }
         self.set_playing(false);
         self.read_recorded_chops();
-        if self.studio.has_draft() {
-            if self.studio.patterns.len() == MAX_PATTERNS {
+        if self.project.studio.has_draft() {
+            if self.project.studio.patterns.len() == MAX_PATTERNS {
                 self.status = Some((
                     "Remove an unused pattern before switching so this draft can be saved.".into(),
                     true,
                 ));
                 return;
             }
-            self.studio
-                .save_pattern(&self.studio.next_pattern_name(), false);
+            self.project.studio
+                .save_pattern(&self.project.studio.next_pattern_name(), false);
         }
-        self.studio.load_pattern(index);
+        self.project.studio.load_pattern(index);
         self.reset_pattern_editor();
     }
 
     fn reset_pattern_editor(&mut self) {
         self.recording_project += 1;
         self.recorded_gates.clear();
-        self.piano_roll = None;
+        self.view.piano_roll = None;
         self.bar = 0;
         self.step = None;
         self.sync();
@@ -3359,21 +3054,21 @@ impl App {
     pub fn toggle_recording(&mut self) {
         if self.recording {
             self.stop_recording();
-        } else if self.clip.is_some() && self.output.is_some()
+        } else if self.media.root().is_some() && self.audio.output().is_some()
             && self.scene_active.is_none() && self.scene_pending.is_none() {
             self.stop_song();
             self.read_recorded_chops();
-            self.piano_roll = None;
+            self.view.piano_roll = None;
             self.recording = true;
             self.stop_listening();
-            let first = self.punch_first.clamp(1, self.studio.bars) - 1;
-            let last = self.punch_last.clamp(first + 1, self.studio.bars);
+            let first = self.punch_first.clamp(1, self.project.studio.bars) - 1;
+            let last = self.punch_last.clamp(first + 1, self.project.studio.bars);
             let range = self.punch_in.then_some(
                 first as u32 * crate::model::TICKS_PER_BAR..last as u32 * crate::model::TICKS_PER_BAR,
             );
             if self.replace_take {
-                self.studio.performance.retain(|note| {
-                    !range.as_ref().map_or(note.tick < self.studio.bars as u32 * crate::model::TICKS_PER_BAR,
+                self.project.studio.performance.retain(|note| {
+                    !range.as_ref().map_or(note.tick < self.project.studio.bars as u32 * crate::model::TICKS_PER_BAR,
                         |range| range.contains(&note.tick))
                 });
             }
@@ -3394,7 +3089,7 @@ impl App {
     }
 
     fn read_recorded_chops(&mut self) {
-        while let Some(capture) = self.output.as_ref().and_then(Output::recorded) {
+        while let Some(capture) = self.audio.output().and_then(Output::recorded) {
             let (project, id, event, start) = match capture {
                 CapturedChop::Start(project, id, event) => (project, id, event, true),
                 CapturedChop::End(project, id, event) => (project, id, event, false),
@@ -3408,7 +3103,7 @@ impl App {
             }
             let key = (event.tick, event.input);
             let index = self
-                .studio
+                .project.studio
                 .performance
                 .binary_search_by_key(&key, |event| (event.tick, event.input));
             if start {
@@ -3417,13 +3112,13 @@ impl App {
                     self.recorded_gates.insert(key, id);
                 }
                 match index {
-                    Ok(index) => self.studio.performance[index] = event,
-                    Err(index) => self.studio.performance.insert(index, event),
+                    Ok(index) => self.project.studio.performance[index] = event,
+                    Err(index) => self.project.studio.performance.insert(index, event),
                 }
             } else if self.recorded_gates.get(&key) == Some(&id) {
                 self.recorded_gates.remove(&key);
                 if let Ok(index) = index {
-                    self.studio.performance[index].length = event.length;
+                    self.project.studio.performance[index].length = event.length;
                 }
             }
         }
@@ -3431,9 +3126,9 @@ impl App {
 
     pub fn toggle_loop(&mut self) {
         if let Some((start, end)) = self.selection() {
-            self.studio.looping = !self.studio.looping;
+            self.project.studio.looping = !self.project.studio.looping;
             self.sync();
-            if self.studio.looping && !(start..end).contains(&self.position) {
+            if self.project.studio.looping && !(start..end).contains(&self.position) {
                 self.seek(start);
             }
         }
@@ -3445,34 +3140,16 @@ impl App {
 
     fn play_pad(&mut self, index: usize, assign: bool, velocity: u8) {
         self.selected_pad = index;
-        if self.clip.is_none() {
+        if self.media.root().is_none() {
             return;
         }
-        if assign || self.studio.pads[index].is_none() {
-            self.studio.pads[index] = Some(self.position.min((self.duration() - 0.001).max(0.0)));
-            self.studio.pad_ends[index] = None;
-            self.studio.pad_sources[index] = self.active_source;
+        if assign || self.project.studio.pads[index].is_none() {
+            self.project.studio.pads[index] = Some(self.position.min((self.duration() - 0.001).max(0.0)));
+            self.project.studio.pad_ends[index] = None;
+            self.project.studio.pad_sources[index] = self.media.active_source();
         } else {
             self.sync();
             self.send(Command::Pad(index, self.pad_mode, velocity));
-        }
-    }
-
-    pub fn clear_pad(&mut self, index: usize) {
-        self.studio.pads[index] = None;
-        self.studio.pad_ends[index] = None;
-        self.studio.pad_sources[index] = 0;
-        self.studio.pad_names[index].clear();
-        self.studio.pad_colors[index] = 0;
-        self.studio.choke_groups.pads[index] = 0;
-        self.studio.instruments.pads.remove(&index);
-        self.studio
-            .performance
-            .retain(|event| event.input != ChopInput::Pad(index as u8));
-        for cell in self.studio.chops.iter_mut().flatten() {
-            if *cell == Some(index) {
-                *cell = None;
-            }
         }
     }
 
@@ -3485,12 +3162,12 @@ impl App {
     }
 
     pub fn assign_piano(&mut self, range: (f64, f64)) {
-        self.assign_piano_source(self.active_source, range);
+        self.assign_piano_source(self.media.active_source(), range);
     }
 
     pub fn assign_piano_source(&mut self, source: usize, range: (f64, f64)) {
-        self.studio.key_sources.insert(self.piano_key, source);
-        self.studio
+        self.project.studio.key_sources.insert(self.piano_key, source);
+        self.project.studio
             .key_chops
             .insert(self.piano_key, KeyChop::Cut(range.0, range.1));
         self.piano_arm = false;
@@ -3506,14 +3183,14 @@ impl App {
         }
         self.piano_key = note;
         if self.piano_arm
-            && !self.studio.chromatic_enabled
+            && !self.project.studio.chromatic_enabled
             && let Some(range) = self.selection()
         {
             self.assign_piano(range);
         }
         self.piano_up(source, note);
-        let notes: Vec<_> = if self.studio.chromatic_enabled {
-            self.studio.harmony.notes(note).collect()
+        let notes: Vec<_> = if self.project.studio.chromatic_enabled {
+            self.project.studio.harmony.notes(note).collect()
         } else {
             vec![note]
         };
@@ -3525,7 +3202,7 @@ impl App {
                     self.send(Command::PianoOn {
                         source, note, velocity, range,
                         bend: self.midi_bend.get(&source).copied().unwrap_or(0.0),
-                        controls: self.studio.controls_for_key(note),
+                        controls: self.project.studio.controls_for_key(note),
                         gate: self.piano_gate,
                     });
                 }
@@ -3546,10 +3223,10 @@ impl App {
     }
 
     pub fn write_arpeggio(&mut self, ascending: bool, division: Quantize) {
-        if !self.studio.chromatic_enabled || self.recording || self.key_range(self.piano_key).is_none() {
+        if !self.project.studio.chromatic_enabled || self.recording || self.key_range(self.piano_key).is_none() {
             return;
         }
-        let mut harmony = self.studio.harmony;
+        let mut harmony = self.project.studio.harmony;
         if harmony.chord == crate::harmony::Chord::Single {
             harmony.chord = crate::harmony::Chord::Triad;
         }
@@ -3558,7 +3235,7 @@ impl App {
         if !ascending { keys.reverse(); }
         let unit = division.triplet_unit().unwrap_or(if division == Quantize::Eighth { 240 } else { 120 });
         let origin = self.bar as u32 * crate::model::TICKS_PER_BAR;
-        self.studio.edit_roll_notes(|notes| {
+        self.project.studio.edit_roll_notes(|notes| {
             for (index, offset) in (0..crate::model::TICKS_PER_BAR).step_by(unit as usize).enumerate() {
                 let tick = origin + offset;
                 let input = ChopInput::Key(keys[index % keys.len()]);
@@ -3577,7 +3254,7 @@ impl App {
             self.midi_output_status = None;
             return;
         };
-        if self.output.is_none() {
+        if self.audio.output().is_none() {
             self.midi_output_status = Some("Start an audio output first. It supplies the MIDI clock.".into());
             return;
         }
@@ -3629,18 +3306,18 @@ impl App {
 
     fn selected_chop_controls(&mut self) -> &mut SampleControls {
         if self.library.midi.piano_view {
-            let inherited = self.studio.controls_for_key(self.piano_key);
-            if self.studio.chromatic_enabled
-                && let Some(chromatic) = &mut self.studio.chromatic
+            let inherited = self.project.studio.controls_for_key(self.piano_key);
+            if self.project.studio.chromatic_enabled
+                && let Some(chromatic) = &mut self.project.studio.chromatic
             {
                 return &mut chromatic.controls;
             }
-            self.studio
+            self.project.studio
                 .key_controls
                 .entry(self.piano_key)
                 .or_insert(inherited)
         } else {
-            &mut self.studio.pad_controls[self.selected_pad]
+            &mut self.project.studio.pad_controls[self.selected_pad]
         }
     }
 
@@ -3668,8 +3345,8 @@ impl App {
             self.song_playing = None;
             self.midi.route_clock(
                 connection,
-                self.output.as_ref().map(Output::sender),
-                self.studio.bpm,
+                self.audio.output().map(Output::sender),
+                self.project.studio.bpm,
             );
         }
     }
@@ -3770,7 +3447,7 @@ impl App {
                 if let Some(seconds) = period {
                     let bpm = 60.0 / (24.0 * seconds);
                     self.midi_clock_bpm = Some(bpm);
-                    self.studio.bpm = bpm.round().clamp(40.0, 240.0) as u16;
+                    self.project.studio.bpm = bpm.round().clamp(40.0, 240.0) as u16;
                     self.sync();
                 }
             }
@@ -3779,7 +3456,7 @@ impl App {
                 if self.drum_templates.is_some() {
                     self.stop_drum_preview();
                 }
-                self.playing = self.output.is_some();
+                self.playing = self.audio.output().is_some();
             },
             Message::Stop => {
                 self.stop_beat_audition();
@@ -3837,17 +3514,17 @@ impl App {
 
     fn midi_parameter_value(&self, target: Target) -> f32 {
         let controls = if self.library.midi.piano_view {
-            if self.studio.chromatic_enabled {
-                self.studio.chromatic.map_or_else(SampleControls::default, |sample| sample.controls)
-            } else { self.studio.controls_for_key(self.piano_key) }
-        } else { self.studio.pad_controls[self.selected_pad] };
+            if self.project.studio.chromatic_enabled {
+                self.project.studio.chromatic.map_or_else(SampleControls::default, |sample| sample.controls)
+            } else { self.project.studio.controls_for_key(self.piano_key) }
+        } else { self.project.studio.pad_controls[self.selected_pad] };
         match target {
-            Target::SampleLevel => self.studio.sample_level,
-            Target::DrumLevel => self.studio.drum_level,
-            Target::Filter => self.studio.filter,
-            Target::Delay => self.studio.delay,
-            Target::Reverb => self.studio.reverb,
-            Target::Swing => self.studio.swing,
+            Target::SampleLevel => self.project.studio.sample_level,
+            Target::DrumLevel => self.project.studio.drum_level,
+            Target::Filter => self.project.studio.filter,
+            Target::Delay => self.project.studio.delay,
+            Target::Reverb => self.project.studio.reverb,
+            Target::Swing => self.project.studio.swing,
             Target::ChopGain => controls.gain / 2.0,
             Target::ChopPan => (controls.pan * 63.0 + 64.0) / 127.0,
             Target::ChopTune => (controls.tune * (63.0 / 24.0) + 64.0) / 127.0,
@@ -3940,14 +3617,14 @@ impl App {
                 }
                 let value = normalized;
                 match target {
-                    Target::SampleLevel => self.studio.sample_level = value,
-                    Target::DrumLevel => self.studio.drum_level = value,
+                    Target::SampleLevel => self.project.studio.sample_level = value,
+                    Target::DrumLevel => self.project.studio.drum_level = value,
                     Target::Filter => {
-                        self.studio.filter = if mapped.is_some() { value } else { 1.0 - value }
+                        self.project.studio.filter = if mapped.is_some() { value } else { 1.0 - value }
                     }
-                    Target::Delay => self.studio.delay = value,
-                    Target::Reverb => self.studio.reverb = value,
-                    Target::Swing => self.studio.swing = value,
+                    Target::Delay => self.project.studio.delay = value,
+                    Target::Reverb => self.project.studio.reverb = value,
+                    Target::Swing => self.project.studio.swing = value,
                     Target::ChopGain => self.selected_chop_controls().gain = value * 2.0,
                     Target::ChopPan => {
                         self.selected_chop_controls().pan =
@@ -4034,7 +3711,7 @@ impl App {
         if self.taps.len() >= 2 {
             let mean =
                 now.duration_since(self.taps[0]).as_secs_f64() / (self.taps.len() - 1) as f64;
-            self.studio.bpm = (60.0 / mean).round().clamp(40.0, 240.0) as u16;
+            self.project.studio.bpm = (60.0 / mean).round().clamp(40.0, 240.0) as u16;
         }
     }
 
@@ -4065,7 +3742,7 @@ impl App {
                 found
             })
         };
-        if self.show_commands || self.drum_templates.is_some() || self.variations.is_some()
+        if self.view.commands.open || self.drum_templates.is_some() || self.variations.is_some()
             || self.snapshot_dialog.is_some()
         { return; }
         if Action::Commands.pressed(pressed) {
@@ -4092,9 +3769,9 @@ impl App {
             || self.daw_dialog
             || self.export_dialog.is_some()
             || self.midi_dialog
-            || self.piano_roll.is_some()
+            || self.view.piano_roll.is_some()
             || self.transcription.editor.is_some()
-            || self.sequence_tool.is_some()
+            || self.view.sequence_tool.is_some()
         {
             return;
         }
@@ -4112,7 +3789,7 @@ impl App {
             ctx.memory_mut(|memory| memory.surrender_focus(widget));
             return;
         }
-        if self.page == Page::Queue {
+        if self.view.page == Page::Queue {
             if key(Key::Z) {
                 self.undo_queue();
             }
@@ -4150,11 +3827,11 @@ impl App {
         if key(Key::Backtick) {
             self.keyboard = !self.keyboard;
             if self.keyboard {
-                self.page = Page::Studio;
+                self.view.page = Page::Studio;
             }
         }
         let shift = ctx.input(|input| input.modifiers.shift);
-        if self.page == Page::Studio && self.keyboard {
+        if self.view.page == Page::Studio && self.keyboard {
             if self.library.midi.piano_view {
                 for (index, key_code) in PIANO_KEYS.into_iter().enumerate() {
                     if key(key_code) {
@@ -4173,7 +3850,7 @@ impl App {
                     }
                 }
                 if key(Key::Backspace) {
-                    self.clear_pad(self.selected_pad);
+                    self.edit_pad(pad_workflow::Edit::Clear(self.selected_pad));
                 }
             }
         } else {
@@ -4193,7 +3870,7 @@ impl App {
                 self.save_record();
             }
             if key(Key::S) {
-                self.page = if self.page == Page::Studio {
+                self.view.page = if self.view.page == Page::Studio {
                     Page::Dig
                 } else {
                     Page::Studio
@@ -4208,8 +3885,8 @@ impl App {
         if key(Key::B) {
             self.tap();
         }
-        if focused.is_none() && self.page == Page::Studio
-            && let Some(time) = &mut self.studio.pads[self.selected_pad]
+        if focused.is_none() && self.view.page == Page::Studio
+            && let Some(time) = &mut self.project.studio.pads[self.selected_pad]
         {
             let amount = if shift { 0.1 } else { 0.01 };
             if key(Key::ArrowLeft) {
@@ -4246,36 +3923,7 @@ fn select_record(records: &[Record], active: Option<&Record>, seed: usize) -> Re
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.read_recorded_chops();
-        if let Some(output) = &mut self.output {
-            output.performance.poll();
-        }
-        if let Some(output) = &self.output {
-            if self
-                .seeked_at
-                .is_none_or(|time| time.elapsed() > Duration::from_millis(60))
-            {
-                self.position = output.meters.position().min(self.duration());
-            }
-            self.preview = output.meters.preview();
-            self.step = output.meters.step();
-            self.scene_active = output.meters.scene();
-            if self.scene_active.is_some() && self.scene_active == self.scene_pending {
-                self.scene_pending = None;
-            }
-            if self.song_playing == Some(output.meters.finished_song()) {
-                self.playing = false;
-                self.song_playing = None;
-            }
-            if output.meters.failed() {
-                self.audio_error = Some("Audio device disconnected.".into());
-                self.recording = false;
-                self.recorded_gates.clear();
-                self.output = None;
-                self.playing = false;
-                self.song_playing = None;
-                self.preview = false;
-            }
-        }
+        self.poll_audio();
         self.poll_taste_listening();
         self.finish_job();
         if self.midi_output_failed.as_ref().is_some_and(|failed| failed.load(std::sync::atomic::Ordering::Relaxed)) {
@@ -4319,23 +3967,22 @@ impl eframe::App for App {
         }
         crate::ui::draw(self, ctx);
         self.project_dialogs(ctx);
-        if self.page != Page::Studio {
+        if self.view.page != Page::Studio {
             self.piano_arm = false;
         }
-        if (self.page != Page::Studio || !self.library.midi.piano_view || self.midi_dialog)
+        if (self.view.page != Page::Studio || !self.library.midi.piano_view || self.midi_dialog)
             && let Some(note) = self.piano_pointer.take()
         {
             self.piano_up(0, note);
         }
-        if self.page != Page::Queue && self.queue_playing.is_some() {
+        if self.view.page != Page::Queue && self.queue_playing.is_some() {
             self.stop_listening();
         }
         if self
             .queue_preview_started
             .is_some_and(|start| start.elapsed() > Duration::from_millis(200))
             && self
-                .output
-                .as_ref()
+                .audio.output()
                 .is_none_or(|output| !output.meters.listening())
         {
             self.stop_listening();
@@ -4379,7 +4026,7 @@ impl eframe::App for App {
         let recovery_enabled = self.input_recording.is_none()
             && self.pending_change.is_none()
             && !self.finishing_close;
-        if let Some(error) = self.session.autosave(self.clip.as_ref(), recovery_enabled) {
+        if let Some(error) = self.session.autosave(self.media.root(), recovery_enabled) {
             self.status = Some((error, true));
             ctx.request_repaint();
         }
@@ -4393,7 +4040,7 @@ impl eframe::App for App {
             self.closing = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        if self.clip.is_some()
+        if self.media.root().is_some()
             || self.input_recording.is_some()
             || self.session.dirty()
             || self.playing
@@ -4419,18 +4066,18 @@ mod tests {
     #[ignore = "requires a working Windows audio output device"]
     fn snapshot_comparison_matches_levels_and_leaves_working_state_intact() -> files::Result<()> {
         let mut app = App::new(egui::Context::default());
-        assert!(app.output.is_some());
-        app.clip = Some(Arc::new(Clip::new(8_000, vec![[0.25; 2]; 4_000])));
-        app.send(Command::Clip(app.clip.clone()));
-        app.studio.bpm = 120;
-        app.studio.bars = 2;
-        app.studio.pads[0] = Some(0.0);
-        app.studio.chops[1][0] = Some(0);
+        assert!(app.audio.output().is_some());
+        app.media.replace(Some(Arc::new(Clip::new(8_000, vec![[0.25; 2]; 4_000]))));
+        app.send(Command::Clip(app.media.root().cloned()));
+        app.project.studio.bpm = 120;
+        app.project.studio.bars = 2;
+        app.project.studio.pads[0] = Some(0.0);
+        app.project.studio.chops[1][0] = Some(0);
         app.save_named_snapshot("Snapshot A/B")?;
-        app.studio.sample_level = 0.5;
-        app.studio.bpm = 100;
+        app.project.studio.sample_level = 0.5;
+        app.project.studio.bpm = 100;
         app.observe_edits(false);
-        let before = app.project_snapshot();
+        let before = app.project.clone();
         app.prepare_snapshot_preview(0, false, 1, true)?;
         let start = Instant::now();
         while app.busy.is_some() && start.elapsed() < Duration::from_secs(4) {
@@ -4445,13 +4092,13 @@ mod tests {
         for side in 0..2 {
             app.play_snapshot_preview(side);
             let start = Instant::now();
-            while !app.output.as_ref().unwrap().meters.listening()
+            while !app.audio.output().unwrap().meters.listening()
                 && start.elapsed() < Duration::from_millis(300)
             {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            assert!(app.output.as_ref().unwrap().meters.listening());
-            assert!(app.project_snapshot() == before);
+            assert!(app.audio.output().unwrap().meters.listening());
+            assert!(app.project.clone() == before);
         }
         app.clear_snapshot_preview();
         Ok(())
@@ -4460,25 +4107,25 @@ mod tests {
     #[test]
     fn snapshot_restore_and_variation_keep_each_create_one_undo_step() -> files::Result<()> {
         let mut app = App::new(egui::Context::default());
-        app.studio.bpm = 108;
-        app.studio.hits[0][0][0] = 2;
+        app.project.studio.bpm = 108;
+        app.project.studio.hits[0][0][0] = 2;
         app.save_named_snapshot("Original")?;
-        app.studio.bpm = 122;
-        app.studio.hits[0][0][0] = 0;
+        app.project.studio.bpm = 122;
+        app.project.studio.hits[0][0][0] = 0;
         app.observe_edits(false);
-        let working = app.project_snapshot();
+        let working = app.project.clone();
         assert!(app.restore_named_snapshot(0));
-        assert_eq!(app.studio.bpm, 108);
-        assert_eq!(app.studio.hits[0][0][0], 2);
+        assert_eq!(app.project.studio.bpm, 108);
+        assert_eq!(app.project.studio.hits[0][0][0], 2);
         app.undo_project(false);
-        assert!(app.project_snapshot() == working);
-        let mut candidate = app.studio.active_sequence();
+        assert!(app.project.clone() == working);
+        let mut candidate = app.project.studio.active_sequence();
         candidate.bars[0].drums[7][8] = 2;
         assert!(app.keep_variation("Fill", candidate));
-        assert_eq!(app.studio.patterns[0].name, "Fill");
-        assert_eq!(app.studio.hits[0][7][8], 2);
+        assert_eq!(app.project.studio.patterns[0].name, "Fill");
+        assert_eq!(app.project.studio.hits[0][7][8], 2);
         app.undo_project(false);
-        assert!(app.project_snapshot() == working);
+        assert!(app.project.clone() == working);
         Ok(())
     }
 
@@ -4486,17 +4133,17 @@ mod tests {
     #[ignore = "requires a working Windows audio output device"]
     fn stopped_transport_capture_survives_undo_reopen_and_export() -> files::Result<()> {
         let mut app = App::new(egui::Context::default());
-        let output = app.output.as_ref().ok_or("No audio device opened")?;
+        let output = app.audio.output().ok_or("No audio device opened")?;
         println!("Audio output {} at {} Hz, buffer request {:?}",
             output.device_name, output.sample_rate, output.requested_buffer);
         let clip = Arc::new(Clip::new(8_000, vec![[0.25; 2]; 4_000]));
-        app.clip = Some(clip.clone());
-        app.send(Command::Clip(app.clip.clone()));
-        app.studio.pads[0] = Some(0.0);
-        app.studio.pad_ends[0] = Some(0.4);
-        app.studio.hits[0][0][4] = 1;
+        app.media.replace(Some(clip.clone()));
+        app.send(Command::Clip(app.media.root().cloned()));
+        app.project.studio.pads[0] = Some(0.0);
+        app.project.studio.pad_ends[0] = Some(0.4);
+        app.project.studio.hits[0][0][4] = 1;
         app.observe_edits(false);
-        let before = app.project_snapshot();
+        let before = app.project.clone();
 
         app.send(Command::Pad(0, PadMode::Gate, 99));
         std::thread::sleep(Duration::from_millis(90));
@@ -4504,17 +4151,17 @@ mod tests {
         app.preview_performance(4);
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(2) {
-            let output = app.output.as_mut().unwrap();
-            output.performance.poll();
+            app.audio.poll();
+            let output = app.audio.output().unwrap();
             if output.performance.preview().is_some() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(app.project_snapshot() == before);
+        assert!(app.project.clone() == before);
         assert!(!app.recording && !app.playing);
         app.keep_performance();
-        let captured = app.project_snapshot();
+        let captured = app.project.clone();
         assert_eq!(captured.studio.patterns.len(), 2);
         assert_eq!(captured.studio.patterns[0].notes.bars[0].drums[0][4], 1);
         let note = &captured.studio.performance[0];
@@ -4522,9 +4169,9 @@ mod tests {
         assert_eq!(note.velocity, 99);
         assert!(note.length.is_some_and(|length| length > 1));
         app.undo_project(false);
-        assert!(app.project_snapshot() == before);
+        assert!(app.project.clone() == before);
         app.undo_project(true);
-        assert!(app.project_snapshot() == captured);
+        assert!(app.project.clone() == captured);
 
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("capture.flip");
@@ -4539,7 +4186,7 @@ mod tests {
         assert!(hound::WavReader::open(wav)?.samples::<i32>().take(10_000)
             .any(|sample| sample.is_ok_and(|sample| sample > 0)));
         use std::sync::atomic::Ordering::Relaxed;
-        let meters = &app.output.as_ref().unwrap().meters;
+        let meters = &app.audio.output().unwrap().meters;
         println!("Observed buffer {} frames; short-test peak callback {:.3} ms",
             meters.callback_frames.load(Relaxed),
             meters.callback_peak_ns.load(Relaxed) as f64 / 1e6);
@@ -4550,7 +4197,7 @@ mod tests {
     fn undo_uses_key_event_modifiers_after_control_is_released() {
         let ctx = egui::Context::default();
         let mut app = App::new(ctx.clone());
-        app.studio.bpm = 105;
+        app.project.studio.bpm = 105;
         app.observe_edits(false);
         let input = egui::RawInput {
             events: vec![egui::Event::Key {
@@ -4563,7 +4210,7 @@ mod tests {
             ..Default::default()
         };
         let _ = ctx.run(input, |ctx| app.shortcuts(ctx));
-        assert_eq!(app.studio.bpm, 90);
+        assert_eq!(app.project.studio.bpm, 90);
         assert!(!app.project_dirty());
     }
 
@@ -4571,14 +4218,14 @@ mod tests {
     #[ignore = "requires a Windows MIDI loopback and an audio output device"]
     fn windows_port_records_midi_pads_and_keys_into_the_pattern() {
         let mut app = App::new(egui::Context::default());
-        assert!(app.output.is_some(), "{:?}", app.audio_error);
+        assert!(app.audio.output().is_some(), "{:?}", app.audio.error());
         app.library.midi = midi::Settings::default();
         app.library.midi.piano_view = true;
         app.midi.configure(&app.library.midi);
-        app.clip = Some(Arc::new(Clip::new(8_000, vec![[0.0; 2]; 8_000])));
-        app.studio.pads[0] = Some(0.0);
-        app.studio.key_chops.insert(108, KeyChop::Cut(0.1, 0.9));
-        app.send(Command::Clip(app.clip.clone()));
+        app.media.replace(Some(Arc::new(Clip::new(8_000, vec![[0.0; 2]; 8_000]))));
+        app.project.studio.pads[0] = Some(0.0);
+        app.project.studio.key_chops.insert(108, KeyChop::Cut(0.1, 0.9));
+        app.send(Command::Clip(app.media.root().cloned()));
         app.toggle_recording();
         let timeout = Instant::now() + Duration::from_secs(15);
         while Instant::now() < timeout {
@@ -4586,7 +4233,7 @@ mod tests {
             app.read_recorded_chops();
             app.sync();
             let recorded = |input, velocity| {
-                app.studio
+                app.project.studio
                     .performance
                     .iter()
                     .any(|event| event.input == input && event.velocity == velocity)
@@ -4598,7 +4245,7 @@ mod tests {
         }
         panic!(
             "MIDI performance was not captured: {:?}",
-            app.studio.performance
+            app.project.studio.performance
         );
     }
 }

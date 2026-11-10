@@ -9,6 +9,9 @@ pub mod grid_edit;
 pub mod groove;
 pub mod instrument;
 pub mod melody;
+pub(crate) mod playback;
+pub(crate) mod preferences;
+pub(crate) mod project;
 pub mod project_version;
 pub mod snapshot;
 mod step_rule;
@@ -408,28 +411,40 @@ impl Sequence {
     }
 
     pub fn has_key_steps(&self, studio: &Studio) -> bool {
+        self.has_key_steps_with(studio.instrument_view())
+    }
+
+    fn has_key_steps_with(&self, instruments: playback::InstrumentView<'_>) -> bool {
         self.bars
             .iter()
             .flat_map(|bar| bar.keys.iter().flatten())
-            .any(|&note| studio.key_range(note, f64::INFINITY).is_some())
+            .any(|&note| instruments.key_range(note, f64::INFINITY).is_some())
             || self.performance.iter().any(|event| {
-                matches!(event.input, ChopInput::Key(_)) && (event.expression.is_some() || studio.input_is_assigned(event.input))
+                matches!(event.input, ChopInput::Key(_)) && (event.expression.is_some() || instruments.input_is_assigned(event.input))
             })
     }
 
     pub fn has_chops(&self, studio: &Studio) -> bool {
-        self.has_pad_steps(studio) || self.has_key_steps(studio)
+        self.has_chops_with(studio.instrument_view())
+    }
+
+    pub(crate) fn has_chops_with(&self, instruments: playback::InstrumentView<'_>) -> bool {
+        self.has_pad_steps_with(instruments) || self.has_key_steps_with(instruments)
     }
 
     pub fn has_pad_steps(&self, studio: &Studio) -> bool {
+        self.has_pad_steps_with(studio.instrument_view())
+    }
+
+    fn has_pad_steps_with(&self, instruments: playback::InstrumentView<'_>) -> bool {
         self.bars
             .iter()
             .flat_map(|bar| bar.pads.iter().flatten())
-            .any(|&pad| studio.pads[pad].is_some())
+            .any(|&pad| instruments.pads[pad].is_some())
             || self
                 .performance
                 .iter()
-                .any(|event| matches!(event.input, ChopInput::Pad(_)) && studio.input_is_assigned(event.input))
+                .any(|event| matches!(event.input, ChopInput::Pad(_)) && instruments.input_is_assigned(event.input))
     }
 
     pub fn has_hits(&self, studio: &Studio) -> bool {
@@ -951,23 +966,10 @@ impl Studio {
         }
     }
 
-    pub fn step_hit_ticks(
-        &self, rule: StepRule, row: usize, absolute: u64, cycle: u64, fill: bool, feel: groove::HitFeel,
-    ) -> impl Iterator<Item = (u64, u64)> + use<> {
-        let start = swung_step(absolute, self.swing);
-        let next = swung_step(absolute + 1, self.swing);
-        let bar_ticks = u64::from(TICKS_PER_BAR);
-        let bar_start = (start / bar_ticks) * bar_ticks;
-        let bar_end = bar_start + bar_ticks;
-        let repeats = u64::from(rule.repeats.clamp(1, 4));
-        let last_hit = start + (next - start) * (repeats - 1) / repeats;
-        let offset = (i64::from(self.lane_offsets[row]) + i64::from(feel.offset)).clamp(
-            -((start - bar_start) as i64), (bar_end - last_hit - 1) as i64,
-        );
-        rule.hits(start, next, row, cycle, fill).map(move |(tick, length)| {
-            (tick.saturating_add_signed(offset), length)
-        })
+    pub(crate) fn step_timing(&self) -> events::StepTiming<'_> {
+        events::StepTiming { swing: self.swing, lane_offsets: &self.lane_offsets }
     }
+
 
     fn roll_step_notes(&self) -> impl Iterator<Item = (usize, usize, PlayedChop)> + '_ {
         (0..self.bars).flat_map(move |bar| {
@@ -982,7 +984,7 @@ impl Studio {
                         .map_or(1, |rule| rule.repeats);
                     let rule = StepRule { repeats, ..StepRule::default() };
                     let feel = self.step_feel[bar].get(&((row * STEPS + step) as u8)).copied().unwrap_or_default();
-                    let tick = self.step_hit_ticks(rule, row, absolute, 0, false, feel).next().unwrap().0 as u32;
+                    let tick = self.step_timing().hit_ticks(rule, row, absolute, 0, false, feel).next().unwrap().0 as u32;
                     let velocity = feel.velocity.unwrap_or(velocity);
                     (bar, step, PlayedChop {
                         id: self.step_ids[bar].get(&((row * STEPS + step) as u8)).copied().unwrap_or_default(),
@@ -1463,22 +1465,11 @@ impl Studio {
     }
 
     pub fn loop_range(&self) -> Option<(f64, f64)> {
-        let start = self.loop_in?;
-        let end = self.loop_out?;
-        (end - start >= MIN_LOOP_SECONDS - 1e-9).then_some((start, end))
+        playback::loop_range(self.loop_in, self.loop_out)
     }
 
     pub fn slice(&self, pad: usize, duration: f64) -> Option<(f64, f64)> {
-        let start = self.pads[pad]?;
-        let end = self.pad_ends[pad].map(|end| end.min(duration)).unwrap_or_else(|| self
-            .pads
-            .iter()
-            .zip(self.pad_sources)
-            .filter_map(|(&time, source)| (source == self.pad_sources[pad]).then_some(time).flatten())
-            .chain(self.loop_out.filter(|_| self.loop_source == self.pad_sources[pad]))
-            .filter(|time| *time > start + 0.001)
-            .fold(duration, f64::min));
-        (end > start).then_some((start, end))
+        self.instrument_view().slice(pad, duration)
     }
 
     pub fn pad_for_key(note: u8) -> Option<usize> {
@@ -1488,62 +1479,23 @@ impl Studio {
     }
 
     pub fn key_source(&self, note: u8) -> usize {
-        if self.chromatic_enabled {
-            return self.chromatic.map_or(0, |sample| sample.source);
-        }
-        if self.key_chops.contains_key(&note) {
-            self.key_sources.get(&note).copied().unwrap_or(0)
-        } else {
-            Self::pad_for_key(note).map_or(0, |pad| self.pad_sources[pad])
-        }
+        self.instrument_view().key_source(note)
     }
 
     pub fn key_layers(&self, note: u8) -> instrument::Layers {
-        if self.chromatic_enabled {
-            return self.instruments.chromatic;
-        }
-        self.instruments.keys.get(&note).copied().unwrap_or_else(|| {
-            if self.key_chops.contains_key(&note) {
-                instrument::Layers::default()
-            } else {
-                Self::pad_for_key(note).map_or_else(instrument::Layers::default, |pad| {
-                    self.pad_layers(pad)
-                })
-            }
-        })
+        self.instrument_view().key_layers(note)
     }
 
     pub fn pad_layers(&self, pad: usize) -> instrument::Layers {
-        self.instruments.pads.get(&pad).copied().unwrap_or_default()
+        self.instrument_view().pad_layers(pad)
     }
 
     pub fn key_range(&self, note: u8, duration: f64) -> Option<(f64, f64)> {
-        if self.chromatic_enabled {
-            let sample = self.chromatic?;
-            let end = sample.end.min(duration);
-            return (sample.start < end).then_some((sample.start, end));
-        }
-        match self.key_chops.get(&note) {
-            Some(KeyChop::Cut(start, end)) => Some((*start, *end)),
-            Some(KeyChop::Muted) => None,
-            None => self.slice(Self::pad_for_key(note)?, duration),
-        }
+        self.instrument_view().key_range(note, duration)
     }
 
     pub fn controls_for_key(&self, note: u8) -> SampleControls {
-        if self.chromatic_enabled && let Some(sample) = self.chromatic {
-            let mut controls = sample.controls;
-            controls.tune += f32::from(note) - f32::from(sample.root);
-            return controls;
-        }
-        self.key_controls.get(&note).copied().unwrap_or_else(|| {
-            if self.key_chops.contains_key(&note) {
-                SampleControls::default()
-            } else {
-                Self::pad_for_key(note)
-                    .map_or_else(SampleControls::default, |pad| self.pad_controls[pad])
-            }
-        })
+        self.instrument_view().controls_for_key(note)
     }
 
     #[cfg(test)]
@@ -1651,32 +1603,12 @@ impl Studio {
         self.bars as u32 * TICKS_PER_BAR
     }
 
-    pub fn same_capture_instruments(&self, other: &Self) -> bool {
-        self.pads == other.pads
-            && self.pad_ends == other.pad_ends
-            && self.pad_sources == other.pad_sources
-            && self.pad_controls == other.pad_controls
-            && self.key_chops == other.key_chops
-            && self.key_sources == other.key_sources
-            && self.key_controls == other.key_controls
-            && self.chromatic_enabled == other.chromatic_enabled
-            && self.chromatic == other.chromatic
-            && self.choke_groups == other.choke_groups
-            && self.instruments == other.instruments
-            && self.sources.iter().map(|record| &record.source)
-                .eq(other.sources.iter().map(|record| &record.source))
-            && self.speed == other.speed
-    }
-
     pub fn performance_is_playable(&self, event: &PlayedChop) -> bool {
         event.tick < self.pattern_ticks() && self.input_is_assigned(event.input)
     }
 
     pub fn input_is_assigned(&self, input: ChopInput) -> bool {
-        match input {
-            ChopInput::Pad(pad) => self.pads.get(usize::from(pad)).is_some_and(Option::is_some),
-            ChopInput::Key(note) => self.key_range(note, f64::INFINITY).is_some(),
-        }
+        self.instrument_view().input_is_assigned(input)
     }
 
     pub fn has_pattern(&self) -> bool {
@@ -1689,27 +1621,9 @@ impl Studio {
     }
 
     pub fn has_chops(&self) -> bool {
-        self.chops[..self.bars]
-            .iter()
-            .flatten()
-            .flatten()
-            .any(|&pad| self.pads[pad].is_some())
-            || self.has_key_steps()
-            || self
-                .performance
-                .iter()
-                .any(|event| self.performance_is_playable(event))
-    }
-
-    pub fn has_key_steps(&self) -> bool {
-        self.key_steps[..self.bars]
-            .iter()
-            .flatten()
-            .flatten()
-            .any(|&note| self.key_range(note, f64::INFINITY).is_some())
-            || self.performance.iter().any(|event| {
-                matches!(event.input, ChopInput::Key(_)) && self.performance_is_playable(event)
-            })
+        self.instrument_view().has_chops(
+            &self.chops[..self.bars], &self.key_steps[..self.bars], &self.performance,
+        )
     }
 
     pub fn active_loop(&self) -> Option<(f64, f64)> {
@@ -1841,7 +1755,7 @@ pub struct Library {
     #[serde(default, skip_serializing_if = "crate::audio::OutputSettings::is_default")]
     pub audio: crate::audio::OutputSettings,
     #[serde(default)]
-    pub interface: crate::ui::preferences::Preferences,
+    pub interface: preferences::Preferences,
     pub records: Vec<SavedRecord>,
     pub collections: Vec<String>,
     pub heard: u64,

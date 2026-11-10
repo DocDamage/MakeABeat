@@ -1,5 +1,6 @@
 use crate::model::events::{Cell, NoteId, ResolvedEvent, StepMetadata, Trigger};
 use crate::model::instrument::{HitSound, Layers, MAX_LAYERS};
+use crate::model::playback::{InstrumentView, PlaybackSettings};
 use crate::model::{
     AutomationTarget, ChopInput, DRUMS, KITS, PlayedChop, Quantize, STEPS, SampleControls,
     Sequence, Studio, TICKS_PER_BAR, TICKS_PER_STEP, swung_step,
@@ -184,10 +185,10 @@ mod tests {
         studio.lane_offsets[2] = 30;
         studio.swing = 1.0;
         let rule = crate::model::StepRule { repeats: 4, ..Default::default() };
-        let times: Vec<_> = studio.step_hit_ticks(rule, 2, 15, 0, false, Default::default()).map(|(tick, _)| tick).collect();
+        let times: Vec<_> = studio.step_timing().hit_ticks(rule, 2, 15, 0, false, Default::default()).map(|(tick, _)| tick).collect();
         assert_eq!(times, [1874, 1889, 1904, 1919]);
         studio.lane_offsets[2] = -30;
-        assert_eq!(studio.step_hit_ticks(rule, 2, 16, 0, false, Default::default()).next().unwrap().0, 1920);
+        assert_eq!(studio.step_timing().hit_ticks(rule, 2, 16, 0, false, Default::default()).next().unwrap().0, 1920);
     }
 
     #[test]
@@ -311,7 +312,7 @@ mod tests {
         ));
         let render = |arranged| {
             let mut mixer = Mixer::new(rate);
-            mixer.settings = studio.clone();
+            mixer.settings = (&studio).into();
             mixer.command(Command::Clip(Some(clip.clone())));
             if arranged {
                 mixer.command(Command::Song(Arc::new(studio.song_sequence().unwrap()), 1));
@@ -578,7 +579,7 @@ pub enum Command {
     PreviewSource(usize),
     InputMonitor(Option<crate::input_audio::Monitor>),
     MidiOutput(Option<Box<crate::midi_out::Sink>>),
-    Settings(Box<Studio>),
+    Settings(Box<PlaybackSettings>),
     Play(bool),
     Seek(f64),
     Audition(f64, f64),
@@ -714,7 +715,7 @@ pub fn output_devices() -> Vec<String> {
 pub struct Output {
     _stream: Stream,
     tx: commands::CommandSender,
-    retired_settings: Receiver<Box<Studio>>,
+    retired_settings: Receiver<Box<PlaybackSettings>>,
     recorded: Receiver<CapturedChop>,
     pub performance: performance_capture::History,
     pub meters: Arc<Meters>,
@@ -1220,7 +1221,7 @@ pub enum CapturedChop {
     End(u64, u64, PlayedChop),
 }
 
-fn pad_assignment(clip: &Clip, studio: &Studio, pad: usize, mode: PadMode) -> Option<SampleAssignment> {
+fn pad_assignment(clip: &Clip, studio: InstrumentView<'_>, pad: usize, mode: PadMode) -> Option<SampleAssignment> {
     let source = studio.pad_sources[pad];
     let duration = clip.source(source)?.duration();
     let start = studio.pads[pad].filter(|&time| time < duration)?;
@@ -1241,14 +1242,14 @@ fn pad_assignment(clip: &Clip, studio: &Studio, pad: usize, mode: PadMode) -> Op
 pub fn pad_frames<'a>(
     clip: &'a Clip, studio: &Studio, pad: usize, velocity: u8, rate: u32,
 ) -> Option<impl Iterator<Item = Frame> + 'a> {
-    let assignment = pad_assignment(clip, studio, pad, PadMode::Slice)?;
+    let assignment = pad_assignment(clip, studio.instrument_view(), pad, PadMode::Slice)?;
     let mut stack = SampleStack::new(assignment, studio.speed / f64::from(rate), velocity, 0.0, HitSound::default(), f64::from(rate));
     stack.head()?;
     Some(std::iter::from_fn(move || stack.frame(clip, f64::from(rate))))
 }
 
 fn key_assignment(
-    studio: &Studio, note: u8, range: (f64, f64), controls: SampleControls,
+    studio: InstrumentView<'_>, note: u8, range: (f64, f64), controls: SampleControls,
 ) -> SampleAssignment {
     let transpose = studio.chromatic.filter(|_| studio.chromatic_enabled)
         .map_or(0.0, |instrument| f32::from(note) - f32::from(instrument.root));
@@ -1262,7 +1263,7 @@ pub fn key_frames<'a>(
     clip: &'a Clip, studio: &Studio, note: u8, velocity: u8, rate: u32,
 ) -> Option<impl Iterator<Item = Frame> + 'a> {
     let range = studio.key_range(note, clip.source(studio.key_source(note))?.duration())?;
-    let assignment = key_assignment(studio, note, range, studio.controls_for_key(note));
+    let assignment = key_assignment(studio.instrument_view(), note, range, studio.controls_for_key(note));
     let mut stack = SampleStack::new(assignment, studio.speed / f64::from(rate), velocity, 0.0, HitSound::default(), f64::from(rate));
     stack.head()?;
     Some(std::iter::from_fn(move || stack.frame(clip, f64::from(rate))))
@@ -1375,7 +1376,7 @@ pub struct Mixer {
     pending_steps: Vec<ResolvedEvent>,
     midi_output: Option<Box<crate::midi_out::Sink>>,
     rate: f64,
-    pub settings: Studio,
+    pub settings: PlaybackSettings,
     clip: Option<Arc<Clip>>,
     preview_source: usize,
     listening: Option<ListenVoice>,
@@ -1431,7 +1432,7 @@ impl Mixer {
         Self {
             stem_route: StemRoute::All,
             rate: f64::from(rate),
-            settings: Studio::default(),
+            settings: PlaybackSettings::default(),
             clip: None,
             input_monitor: None,
             fill: false,
@@ -1491,7 +1492,7 @@ impl Mixer {
         }
     }
 
-    fn replace_settings(&mut self, settings: &mut Studio) {
+    fn replace_settings(&mut self, settings: &mut PlaybackSettings) {
         if self.settings.bpm != settings.bpm && !self.external_clock {
             self.stop_beat_audition();
         }
@@ -1728,7 +1729,7 @@ impl Mixer {
                 controls,
                 gate,
             } => {
-                let assignment = key_assignment(&self.settings, note, range, controls);
+                let assignment = key_assignment(self.settings.instrument_view(), note, range, controls);
                 let voices = SampleStack::new(assignment, self.settings.speed / self.rate, velocity, bend, HitSound::default(), self.rate);
                 if voices.head().is_none() {
                     return;
@@ -1751,7 +1752,7 @@ impl Mixer {
                         velocity,
                         if gate { PadMode::Gate } else { PadMode::Slice },
                     );
-                    if self.clip.as_deref().and_then(|clip| clip.source(self.settings.key_source(note)))
+                    if self.clip.as_deref().and_then(|clip| clip.source(self.settings.instrument_view().key_source(note)))
                         .is_some_and(|clip| range.0 < range.1 && range.0 < clip.duration())
                     {
                         self.capture_input(InputEvent::On(performance_capture::Note {
@@ -2008,7 +2009,7 @@ impl Mixer {
     fn prepare_pattern_sample(&mut self) {
         let chops = self.playback_sequence().map_or_else(
             || self.settings.has_chops(),
-            |sequence| sequence.has_chops(&self.settings),
+            |sequence| sequence.has_chops_with(self.settings.instrument_view()),
         );
         if chops {
             self.preview = false;
@@ -2053,7 +2054,7 @@ impl Mixer {
 
     fn start_pad(&mut self, pad: usize, mode: PadMode, velocity: u8, sound: HitSound) -> bool {
         let Some(assignment) = self.clip.as_deref()
-            .and_then(|clip| pad_assignment(clip, &self.settings, pad, mode))
+            .and_then(|clip| pad_assignment(clip, self.settings.instrument_view(), pad, mode))
         else {
             return false;
         };
@@ -2193,7 +2194,8 @@ impl Mixer {
             if early != schedule_early && (early || self.early_step_queued) {
                 continue;
             }
-            self.pending_steps.extend(cell.resolve(&self.settings, row, absolute, cycle, self.fill));
+            let timing = self.settings.step_timing();
+            self.pending_steps.extend(cell.resolve(timing, row, absolute, cycle, self.fill));
         }
         index
     }
@@ -2242,14 +2244,15 @@ impl Mixer {
                     }
                     return;
                 }
-                let clip_source = self.settings.key_source(note);
+                let instruments = self.settings.instrument_view();
+                let clip_source = instruments.key_source(note);
                 let Some(clip) = self.clip.as_deref().and_then(|clip| clip.source(clip_source)) else {
                     return;
                 };
-                let Some(range) = self.settings.key_range(note, clip.duration()) else {
+                let Some(range) = instruments.key_range(note, clip.duration()) else {
                     return;
                 };
-                let assignment = key_assignment(&self.settings, note, range, self.settings.controls_for_key(note));
+                let assignment = key_assignment(instruments, note, range, instruments.controls_for_key(note));
                 let mut voices = SampleStack::new(assignment, self.settings.speed / self.rate, event.velocity, 0.0, event.sound, self.rate);
                 if voices.head().is_some() {
                     if self.mono_enabled() {
@@ -2525,11 +2528,11 @@ impl Mixer {
             if let Some((automation, local_tick)) = local
                 && !automation.points(target).is_empty()
             {
-                automation.value(target, local_tick, target.baseline(&self.settings))
+                automation.value(target, local_tick, target.baseline(self.settings.sample_level, self.settings.drum_level))
             } else {
                 sequence
                     .automation
-                    .value(target, position, target.baseline(&self.settings))
+                    .value(target, position, target.baseline(self.settings.sample_level, self.settings.drum_level))
             }
         };
         let sample_level = value(AutomationTarget::SampleVolume);

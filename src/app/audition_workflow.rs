@@ -80,7 +80,7 @@ impl App {
     }
 
     pub fn audition_saved_cut_with_beat(&mut self, index: usize) {
-        let Some(cut) = self.samples.get(index) else {
+        let Some(cut) = self.project.samples.get(index) else {
             return;
         };
         if let Some(clip) = self.source_arc(cut.source) {
@@ -94,7 +94,7 @@ impl App {
         };
         let record = entry.record;
         let queue_origin = record.source.clone();
-        let source = (0..=self.studio.sources.len()).find(|&i| {
+        let source = (0..=self.project.studio.sources.len()).find(|&i| {
             self.source_record(i)
                 .is_some_and(|current| current.source == record.source)
         });
@@ -128,7 +128,7 @@ impl App {
     }
 
     fn open_beat_audition(&mut self, title: String, target: Target) {
-        if self.output.is_none() {
+        if self.audio.output().is_none() {
             return;
         }
         self.stop_beat_audition();
@@ -142,7 +142,7 @@ impl App {
             prepared: None,
             status: None,
             preparing: false,
-            bpm: self.studio.bpm,
+            bpm: self.project.studio.bpm,
             map: None,
             external: self.midi_clock_connection.is_some(),
             paused: false,
@@ -195,11 +195,11 @@ impl App {
         };
         self.audition.jobs.clear();
         self.audition.serial += 1;
-        preview.bpm = self.studio.bpm;
+        preview.bpm = self.project.studio.bpm;
         preview.map = preview
             .target
             .source
-            .and_then(|index| self.studio.beat_maps.get(&index))
+            .and_then(|index| self.project.studio.beat_maps.get(&index))
             .cloned();
         if !preview.paused {
             preview.status = None;
@@ -244,7 +244,7 @@ impl App {
     }
 
     pub(super) fn queue_beat_audition(&self) {
-        let Some(output) = &self.output else { return };
+        let Some(output) = self.audio.output() else { return };
         let Some(preview) = &self.audition.preview else {
             return;
         };
@@ -263,7 +263,7 @@ impl App {
     }
 
     pub(super) fn poll_beat_audition(&mut self) {
-        if let Some(output) = &self.output {
+        if let Some(output) = self.audio.output() {
             output.retire_beat_auditions();
         }
         if let Some(preview) = &self.audition.preview {
@@ -274,13 +274,13 @@ impl App {
                 self.source_arc(index)
                     .is_none_or(|current| !Arc::ptr_eq(&current.frames, &original.frames))
             });
-            if source_changed || self.output.is_none() {
+            if source_changed || self.audio.output().is_none() {
                 self.stop_beat_audition();
-            } else if (!preview.external && preview.bpm != self.studio.bpm)
+            } else if (!preview.external && preview.bpm != self.project.studio.bpm)
                 || preview
                     .target
                     .source
-                    .is_some_and(|index| self.studio.beat_maps.get(&index) != preview.map.as_ref())
+                    .is_some_and(|index| self.project.studio.beat_maps.get(&index) != preview.map.as_ref())
             {
                 self.send(Command::StopBeatAudition);
                 self.prepare_beat_audition();
@@ -348,44 +348,44 @@ mod tests {
     #[ignore = "requires a working Windows audio output device"]
     fn repeated_saved_cut_audition_preserves_project_and_refits_after_tempo_change() {
         let mut app = App::new(eframe::egui::Context::default());
-        assert!(app.output.is_some(), "{:?}", app.audio_error);
-        app.clip = Some(Arc::new(Clip::new(8_000, vec![[0.12; 2]; 12_000])));
-        app.studio.bpm = 240;
-        app.studio.hits[0][0][0] = 1;
+        assert!(app.audio.output().is_some(), "{:?}", app.audio.error());
+        app.media.replace(Some(Arc::new(Clip::new(8_000, vec![[0.12; 2]; 12_000]))));
+        app.project.studio.bpm = 240;
+        app.project.studio.hits[0][0][0] = 1;
         let mut map = BeatMap::default();
         map.beats
             .extend([0.1, 0.35, 0.6, 0.85, 1.1].map(Beat::manual));
         map.set_downbeat(0);
-        app.studio.beat_maps.insert(0, Arc::new(map));
-        app.samples.push(NamedSample {
+        app.project.studio.beat_maps.insert(0, Arc::new(map));
+        app.project.samples.push(NamedSample {
             name: "Break".into(),
             start: 0.1,
             end: 1.1,
             source: 0,
         });
-        app.send(Command::Clip(app.clip.clone()));
+        app.send(Command::Clip(app.media.root().cloned()));
         app.observe_edits(false);
-        app.session.reset(app.project_snapshot(), None, None);
+        app.session.reset(app.project.clone(), None, None);
         let before = app.session.current.clone();
         app.set_playing(true);
         for _ in 0..2 {
             app.audition_saved_cut_with_beat(0);
             wait_for(&mut app, |app| {
-                app.output.as_ref().unwrap().meters.beat_audition() == 2
+                app.audio.output().unwrap().meters.beat_audition() == 2
             });
-            assert!(app.output.as_ref().unwrap().meters.step().is_some());
+            assert!(app.audio.output().unwrap().meters.step().is_some());
             app.stop_beat_audition();
             wait_for(&mut app, |app| {
-                app.output.as_ref().unwrap().meters.beat_audition() == 0
+                app.audio.output().unwrap().meters.beat_audition() == 0
             });
             assert!(app.playing);
-            assert!(app.project_snapshot() == *before && !app.can_undo_project(false));
+            assert!(app.project.clone() == *before && !app.can_undo_project(false));
         }
         app.audition_saved_cut_with_beat(0);
         wait_for(&mut app, |app| {
-            app.output.as_ref().unwrap().meters.beat_audition() == 2
+            app.audio.output().unwrap().meters.beat_audition() == 2
         });
-        app.studio.bpm = 200;
+        app.project.studio.bpm = 200;
         app.observe_edits(false);
         wait_for(&mut app, |app| {
             app.audition
@@ -394,12 +394,12 @@ mod tests {
                 .and_then(|p| p.prepared.as_ref())
                 .and_then(|p| p.fitted.as_ref())
                 .is_some_and(|clip| clip.duration() == 1.2)
-                && app.output.as_ref().unwrap().meters.beat_audition() == 2
+                && app.audio.output().unwrap().meters.beat_audition() == 2
         });
         assert!(app.playing);
         app.stop_beat_audition();
         app.undo_project(false);
-        assert!(app.project_snapshot() == *before && !app.can_undo_project(false));
+        assert!(app.project.clone() == *before && !app.can_undo_project(false));
         app.stop_all();
     }
 }

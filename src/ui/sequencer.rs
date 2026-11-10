@@ -35,24 +35,24 @@ pub(super) fn show(app: &mut App, ui: &mut Ui) {
     panel().show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal_wrapped(|ui| {
-            let name = app.studio.editing_pattern.map_or("Working pattern", |index| {
-                app.studio.patterns[index].name.as_str()
+            let name = app.project.studio.editing_pattern.map_or("Working pattern", |index| {
+                app.project.studio.patterns[index].name.as_str()
             });
             ui.add_sized([148.0, 20.0], Label::new(label(name, 14.0, MINT).strong()).truncate());
             recording_controls(app, ui);
             small(ui, "BPM");
-            let tempo = ui.add(DragValue::new(&mut app.studio.bpm).range(40..=240).speed(0.25));
-            named_number(tempo, "Tempo in beats per minute", f64::from(app.studio.bpm));
+            let tempo = ui.add(DragValue::new(&mut app.project.studio.bpm).range(40..=240).speed(0.25));
+            named_number(tempo, "Tempo in beats per minute", f64::from(app.project.studio.bpm));
             if action(ui, "Tap", true).clicked() {
                 app.tap();
             }
             small(ui, "Kit");
             ComboBox::from_id_salt("kit")
-                .selected_text(KITS[app.studio.kit])
+                .selected_text(KITS[app.project.studio.kit])
                 .width(72.0)
                 .show_ui(ui, |ui| {
                     for (index, name) in KITS.into_iter().enumerate() {
-                        ui.selectable_value(&mut app.studio.kit, index, name);
+                        ui.selectable_value(&mut app.project.studio.kit, index, name);
                     }
                 })
                 .response.on_hover_text("Choose the drum kit");
@@ -60,7 +60,7 @@ pub(super) fn show(app: &mut App, ui: &mut Ui) {
             if let Some(estimate) = app.tempo_estimate
                 && action(ui, &format!("Estimated {} BPM…", estimate.bpm), true).clicked()
             {
-                app.sequence_tool = Some(Tool::Tempo);
+                app.view.sequence_tool = Some(Tool::Tempo);
             }
         });
         ui.horizontal_wrapped(|ui| {
@@ -83,7 +83,7 @@ pub(super) fn show(app: &mut App, ui: &mut Ui) {
 }
 
 fn recording_controls(app: &mut App, ui: &mut Ui) {
-    let can_record = app.recording || (app.output.is_some() && app.clip.is_some());
+    let can_record = app.recording || (app.audio.output().is_some() && app.media.root().is_some());
     if action(
         ui,
         if app.recording {
@@ -119,7 +119,7 @@ fn recording_controls(app: &mut App, ui: &mut Ui) {
 }
 
 fn bar_navigation(app: &mut App, ui: &mut Ui) {
-    let bars = app.studio.bars;
+    let bars = app.project.studio.bars;
     app.bar = app.bar.min(bars - 1);
     let playing = app
         .song_playing
@@ -168,7 +168,7 @@ fn instruments(app: &mut App, ui: &mut Ui) {
         .selected_text(format!("Pad {:02}", app.selected_pad + 1))
         .show_ui(ui, |ui| {
             for pad in 0..STEPS {
-                if app.studio.pads[pad].is_some() {
+                if app.project.studio.pads[pad].is_some() {
                     ui.selectable_value(&mut app.selected_pad, pad, format!("Pad {:02}", pad + 1));
                 }
             }
@@ -197,17 +197,17 @@ fn tools(app: &mut App, ui: &mut Ui, grid: &step_grid::State) {
                 (
                     "Clear pad steps",
                     ClearLane::Pads,
-                    app.studio.chops[bar].iter().any(Option::is_some),
+                    app.project.studio.chops[bar].iter().any(Option::is_some),
                 ),
                 (
                     "Clear key steps",
                     ClearLane::Keys,
-                    app.studio.key_steps[bar].iter().any(Option::is_some),
+                    app.project.studio.key_steps[bar].iter().any(Option::is_some),
                 ),
                 (
                     "Clear drums",
                     ClearLane::Drums,
-                    app.studio.hits[bar].iter().flatten().any(|&hit| hit > 0),
+                    app.project.studio.hits[bar].iter().flatten().any(|&hit| hit > 0),
                 ),
             ];
             for (label, lane, enabled) in lanes {
@@ -226,7 +226,7 @@ fn tools(app: &mut App, ui: &mut Ui, grid: &step_grid::State) {
             (Tool::Groove, true),
         ] {
             if menu_action(ui, &format!("{}…", tool.title()), enabled) {
-                app.sequence_tool = Some(tool);
+                app.view.sequence_tool = Some(tool);
             }
         }
         ui.separator();
@@ -244,7 +244,7 @@ fn tools(app: &mut App, ui: &mut Ui, grid: &step_grid::State) {
                 .flatten()
                 .map(|region| (app.bar, region));
             app.variations = Some(variation::Dialog::new(
-                app.studio.active_sequence(),
+                app.project.studio.active_sequence(),
                 selected,
             ));
         }
@@ -255,8 +255,8 @@ fn tools(app: &mut App, ui: &mut Ui, grid: &step_grid::State) {
         ) {
             app.estimate_tempo();
         }
-        let free_pad = app.studio.pads.iter().any(Option::is_none);
-        let has_sound = app.studio.has_pattern() || app.studio.active_loop().is_some();
+        let free_pad = app.project.studio.pads.iter().any(Option::is_none);
+        let has_sound = app.project.studio.has_pattern() || app.project.studio.active_loop().is_some();
         if menu_action(
             ui,
             "Resample pattern to pad",
@@ -273,9 +273,9 @@ fn tools(app: &mut App, ui: &mut Ui, grid: &step_grid::State) {
 
 fn bar_tools(app: &mut App, ui: &mut Ui) {
     ui.add_enabled_ui(!app.recording, |ui| {
-        ui.menu_button(format!("Pattern length · {} bars", app.studio.bars), |ui| {
+        ui.menu_button(format!("Pattern length · {} bars", app.project.studio.bars), |ui| {
             for count in 1..=MAX_BARS {
-                if menu_action(ui, &count.to_string(), count != app.studio.bars) {
+                if menu_action(ui, &count.to_string(), count != app.project.studio.bars) {
                     app.edit_sequence([Edit::Bar(BarEdit::SetCount(count))], false);
                 }
             }
@@ -283,14 +283,14 @@ fn bar_tools(app: &mut App, ui: &mut Ui) {
     });
     let editable = can_select(app);
     if menu_action(ui, "Copy bar", editable) {
-        app.bar_clipboard = Some(app.studio.copy_bar(app.bar));
+        app.bar_clipboard = Some(app.project.studio.copy_bar(app.bar));
     }
-    let space = app.studio.bars < MAX_BARS;
+    let space = app.project.studio.bars < MAX_BARS;
     for (label, edit, enabled) in [
         ("Paste bar", BarEdit::Paste, app.bar_clipboard.is_some()),
         ("Duplicate bar", BarEdit::Duplicate, space),
         ("Insert blank bar after", BarEdit::Insert, space),
-        ("Remove bar", BarEdit::Remove, app.studio.bars > 1),
+        ("Remove bar", BarEdit::Remove, app.project.studio.bars > 1),
     ] {
         if menu_action(ui, label, editable && enabled) {
             app.edit_sequence([Edit::Bar(edit)], false);
@@ -325,7 +325,7 @@ impl Tool {
 }
 
 pub(super) fn dialog(app: &mut App, ctx: &Context) {
-    let Some(tool) = app.sequence_tool else {
+    let Some(tool) = app.view.sequence_tool else {
         return;
     };
     let id = Id::new(GRID_STATE);
@@ -351,7 +351,7 @@ pub(super) fn dialog(app: &mut App, ctx: &Context) {
         ui.button("Done").clicked()
     });
     if modal.inner || modal.should_close() {
-        app.sequence_tool = None;
+        app.view.sequence_tool = None;
     }
     ctx.data_mut(|data| data.insert_temp(id, grid));
 }
@@ -371,12 +371,12 @@ fn recording_options(app: &mut App, ui: &mut Ui) {
             ui.horizontal_wrapped(|ui| {
                 ui.add(
                     DragValue::new(&mut app.punch_first)
-                        .range(1..=app.studio.bars)
+                        .range(1..=app.project.studio.bars)
                         .prefix("From bar "),
                 );
                 ui.add(
                     DragValue::new(&mut app.punch_last)
-                        .range(app.punch_first.min(app.studio.bars)..=app.studio.bars)
+                        .range(app.punch_first.min(app.project.studio.bars)..=app.project.studio.bars)
                         .prefix("Through bar "),
                 );
             });
@@ -417,21 +417,21 @@ fn tempo_estimate(app: &mut App, ui: &mut Ui) {
                 if menu_action(
                     ui,
                     "Audition beat grid",
-                    app.output.is_some() && !app.playing,
+                    app.audio.output().is_some() && !app.playing,
                 ) {
                     app.audition_tempo(candidate);
                 }
                 if menu_action(ui, "Apply tempo", true) {
-                    app.studio.bpm = candidate;
+                    app.project.studio.bpm = candidate;
                     app.tempo_estimate = None;
-                    app.sequence_tool = None;
+                    app.view.sequence_tool = None;
                     app.send(Command::StopListening);
                 }
             });
         }
         if action(ui, "Dismiss estimate", true).clicked() {
             app.tempo_estimate = None;
-            app.sequence_tool = None;
+            app.view.sequence_tool = None;
         }
     });
 }
@@ -495,13 +495,12 @@ mod tests {
         let ctx = Context::default();
         super::super::style(&ctx);
         let mut app = App::new(ctx.clone());
-        app.output = None;
-        app.audio_error = None;
+        app.audio = Default::default();
         app.library.interface = Default::default();
-        app.library.interface.apply(&ctx);
-        app.page = Page::Studio;
-        app.studio_view = StudioView::Sequence;
-        app.studio.bars = MAX_BARS;
+        crate::ui::preferences::apply(app.library.interface, &ctx);
+        app.view.page = Page::Studio;
+        app.view.studio_view = StudioView::Sequence;
+        app.project.studio.bars = MAX_BARS;
         ctx.enable_accesskit();
         render(&mut app, &ctx, vec![]);
         let output = render(&mut app, &ctx, vec![]);
@@ -522,11 +521,11 @@ mod tests {
         render(&mut app, &ctx, vec![Event::PointerMoved(second)]);
         render(&mut app, &ctx, vec![button(second, false)]);
         assert_eq!(
-            [0, 1].map(|step| drum_velocity(app.studio.hits[0][0][step])),
+            [0, 1].map(|step| drum_velocity(app.project.studio.hits[0][0][step])),
             [89, 89]
         );
         app.undo_project(false);
-        assert_eq!(app.studio.hits[0][0][..2], [0, 0]);
+        assert_eq!(app.project.studio.hits[0][0][..2], [0, 0]);
 
         let output = render(&mut app, &ctx, vec![]);
         let tools = widget(&output, "Sequence tools").unwrap();
@@ -537,8 +536,8 @@ mod tests {
         let output = render(&mut app, &ctx, vec![]);
         let remove = widget(&output, "Remove bar").expect("remove action");
         click(&mut app, &ctx, remove);
-        assert_eq!(app.studio.bars, MAX_BARS - 1);
+        assert_eq!(app.project.studio.bars, MAX_BARS - 1);
         app.undo_project(false);
-        assert_eq!(app.studio.bars, MAX_BARS);
+        assert_eq!(app.project.studio.bars, MAX_BARS);
     }
 }

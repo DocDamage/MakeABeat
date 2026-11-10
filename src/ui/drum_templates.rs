@@ -192,8 +192,7 @@ impl Browser {
                 }
                 let listening = self.preview_started
                     && app
-                        .output
-                        .as_ref()
+                        .audio.output()
                         .is_some_and(|output| output.meters.listening());
                 if action(ui, "Stop preview", listening || app.drum_preview_pending()).clicked() {
                     self.preview_request = None;
@@ -206,7 +205,7 @@ impl Browser {
                     .on_disabled_hover_text("The template must fit within the pattern limit. Stop playback and recording before applying.")
                     .clicked()
                 {
-                    close = app.studio.apply_drum_template(bar, template, self.use_groove);
+                    close = app.project.studio.apply_drum_template(bar, template, self.use_groove);
                 }
                 if length > 1 {
                     ui.separator();
@@ -226,7 +225,7 @@ impl Browser {
                 ui.label(message);
             }
             if let Some(end) = end {
-                let extension = if end > app.studio.bars {
+                let extension = if end > app.project.studio.bars {
                     format!(" Extends the pattern to {end} bars.")
                 } else {
                     String::new()

@@ -1,4 +1,4 @@
-use super::{MAX_SONG_BARS, Studio, TICKS_PER_BAR};
+use super::{MAX_SONG_BARS, TICKS_PER_BAR};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -33,11 +33,11 @@ impl AutomationTarget {
         }
     }
 
-    pub fn baseline(self, studio: &Studio) -> f32 {
+    pub fn baseline(self, sample_level: f32, drum_level: f32) -> f32 {
         match self {
             Self::MasterVolume | Self::LowPass => 1.0,
-            Self::SampleVolume => studio.sample_level,
-            Self::DrumVolume => studio.drum_level,
+            Self::SampleVolume => sample_level,
+            Self::DrumVolume => drum_level,
             Self::Delay | Self::Reverb => 0.0,
         }
     }

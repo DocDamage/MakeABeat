@@ -1,4 +1,4 @@
-use super::{Command, Mixer, Studio};
+use super::{Command, Mixer, PlaybackSettings};
 use std::{
     collections::VecDeque,
     sync::{
@@ -39,11 +39,11 @@ impl CommandSender {
 pub(crate) struct CommandReceiver {
     shared: CommandSender,
     batch: VecDeque<Command>,
-    retire: SyncSender<Box<Studio>>,
-    pending_retirement: Option<Box<Studio>>,
+    retire: SyncSender<Box<PlaybackSettings>>,
+    pending_retirement: Option<Box<PlaybackSettings>>,
 }
 
-pub(crate) fn channel() -> (CommandSender, CommandReceiver, Receiver<Box<Studio>>) {
+pub(crate) fn channel() -> (CommandSender, CommandReceiver, Receiver<Box<PlaybackSettings>>) {
     let send = CommandSender(Arc::new(Mutex::new(Some(VecDeque::new()))));
     let (retire, retired) = sync_channel(RETIRED_SETTINGS);
     let receive = CommandReceiver {
@@ -87,7 +87,7 @@ impl CommandReceiver {
         }
     }
 
-    fn retire(&mut self, settings: Box<Studio>) -> bool {
+    fn retire(&mut self, settings: Box<PlaybackSettings>) -> bool {
         match self.retire.try_send(settings) {
             Ok(()) => true,
             Err(TrySendError::Full(settings) | TrySendError::Disconnected(settings)) => {
@@ -119,11 +119,10 @@ mod tests {
     use super::*;
 
     fn settings(bpm: u16, level: f32) -> Command {
-        Command::Settings(Box::new(Studio {
-            bpm,
-            sample_level: level,
-            ..Studio::default()
-        }))
+        let mut settings = PlaybackSettings::default();
+        settings.bpm = bpm;
+        settings.sample_level = level;
+        Command::Settings(Box::new(settings))
     }
 
     #[test]

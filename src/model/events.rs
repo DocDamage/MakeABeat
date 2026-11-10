@@ -1,5 +1,5 @@
 use super::instrument::HitSound;
-use super::{ChopInput, DRUMS, PlayedChop, STEPS, StepRule, Studio, drum_velocity};
+use super::{ChopInput, DRUMS, PlayedChop, STEPS, StepRule, Studio, TICKS_PER_BAR, drum_velocity, groove::HitFeel, swung_step};
 use crate::{audio::PadMode, midi_out::DRUM_NOTES};
 use serde::{Deserialize, Serialize};
 
@@ -136,7 +136,7 @@ impl Cell {
 
     pub fn resolve(
         self,
-        studio: &Studio,
+        timing: StepTiming<'_>,
         row: usize,
         step: u64,
         cycle: u64,
@@ -148,8 +148,8 @@ impl Cell {
         } else {
             velocity
         };
-        studio
-            .step_hit_ticks(self.rule, row, step, cycle, fill, self.feel)
+        timing
+            .hit_ticks(self.rule, row, step, cycle, fill, self.feel)
             .map(move |(tick, midi_ticks)| ResolvedEvent {
                 id: self.id,
                 trigger: self.trigger,
@@ -171,4 +171,29 @@ pub struct StepMetadata<'a> {
     pub sounds: &'a std::collections::BTreeMap<u8, HitSound>,
     pub ids: &'a super::StepIds,
     pub feel: &'a super::groove::HitFeels,
+}
+
+pub(crate) struct StepTiming<'a> {
+    pub swing: f32,
+    pub lane_offsets: &'a [i8; LANES],
+}
+
+impl StepTiming<'_> {
+    pub(crate) fn hit_ticks(
+        self, rule: StepRule, row: usize, absolute: u64, cycle: u64, fill: bool, feel: HitFeel,
+    ) -> impl Iterator<Item = (u64, u64)> + use<> {
+        let start = swung_step(absolute, self.swing);
+        let next = swung_step(absolute + 1, self.swing);
+        let bar_ticks = u64::from(TICKS_PER_BAR);
+        let bar_start = (start / bar_ticks) * bar_ticks;
+        let bar_end = bar_start + bar_ticks;
+        let repeats = u64::from(rule.repeats.clamp(1, 4));
+        let last_hit = start + (next - start) * (repeats - 1) / repeats;
+        let offset = (i64::from(self.lane_offsets[row]) + i64::from(feel.offset)).clamp(
+            -((start - bar_start) as i64), (bar_end - last_hit - 1) as i64,
+        );
+        rule.hits(start, next, row, cycle, fill).map(move |(tick, length)| {
+            (tick.saturating_add_signed(offset), length)
+        })
+    }
 }

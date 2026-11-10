@@ -108,12 +108,12 @@ impl Selection {
                 if action(ui, "Copy cells", region.is_some()).clicked()
                     && let Some(region) = region
                 {
-                    self.clipboard = Some(GridClipboard::copy(&app.studio, app.bar, region));
+                    self.clipboard = Some(GridClipboard::copy(&app.project.studio, app.bar, region));
                 }
                 if action(ui, "Cut cells", region.is_some()).clicked()
                     && let Some(region) = region
                 {
-                    self.clipboard = Some(GridClipboard::copy(&app.studio, app.bar, region));
+                    self.clipboard = Some(GridClipboard::copy(&app.project.studio, app.bar, region));
                     app.edit_sequence([Edit::ClearCells(region)], false);
                 }
                 let target = region.map(|region| region.first);
@@ -191,7 +191,7 @@ fn corner_controls(ui: &mut Ui, label: &str, cell: &mut Cell) -> bool {
 
 pub(super) fn show(app: &mut App, ui: &mut Ui, state: &mut State) {
     let high_contrast = app.library.interface.high_contrast;
-    let colors = app.library.interface.control_colors();
+    let colors = super::preferences::control_colors(app.library.interface);
     let selection = &mut state.selection;
     let can_select = !app.recording && app.song_playing.is_none();
     let selecting = selection.enabled() && can_select;
@@ -229,7 +229,7 @@ pub(super) fn show(app: &mut App, ui: &mut Ui, state: &mut State) {
     let allows_pointer = app.drum_templates.is_none()
         && app.variations.is_none()
         && app.snapshot_dialog.is_none()
-        && app.sequence_tool.is_none()
+        && app.view.sequence_tool.is_none()
         && ui.memory(|memory| memory.allows_interaction(layer));
     let on_grid_layer =
         |&position: &Pos2| allows_pointer && ui.ctx().layer_id_at(position) == Some(layer);
@@ -239,8 +239,8 @@ pub(super) fn show(app: &mut App, ui: &mut Ui, state: &mut State) {
     let mut selection_end = None;
     let mut edits = Vec::new();
     let mut recorded = [[0; STEPS]; 2];
-    for event in &app.studio.performance {
-        if event.tick / TICKS_PER_BAR == bar as u32 && app.studio.performance_is_playable(event) {
+    for event in &app.project.studio.performance {
+        if event.tick / TICKS_PER_BAR == bar as u32 && app.project.studio.performance_is_playable(event) {
             let row = usize::from(matches!(event.input, ChopInput::Key(_)));
             let step = (event.tick % TICKS_PER_BAR / TICKS_PER_STEP) as usize;
             recorded[row][step] += 1;
@@ -287,19 +287,19 @@ pub(super) fn show(app: &mut App, ui: &mut Ui, state: &mut State) {
                     for step in 0..STEPS {
                         let count = recorded.get(row).map_or(0, |counts| counts[step]);
                         let (fill, text) = if row == 0 {
-                            let pad = app.studio.chops[bar][step];
+                            let pad = app.project.studio.chops[bar][step];
                             (
                                 pad.map(|_| Color32::from_rgb(34, 84, 115)),
                                 pad.map_or(String::new(), |pad| (pad + 1).to_string()),
                             )
                         } else if row == 1 {
-                            let note = app.studio.key_steps[bar][step];
+                            let note = app.project.studio.key_steps[bar][step];
                             (
                                 note.map(|_| Color32::from_rgb(26, 87, 68)),
                                 note.map_or_else(String::new, piano_note),
                             )
                         } else {
-                            let velocity = drum_velocity(app.studio.hits[bar][row - 2][step]);
+                            let velocity = drum_velocity(app.project.studio.hits[bar][row - 2][step]);
                             let fill = (velocity > 0).then(|| {
                                 let intensity = f32::from(velocity) / 127.0;
                                 Color32::from_rgb(
@@ -365,7 +365,7 @@ pub(super) fn show(app: &mut App, ui: &mut Ui, state: &mut State) {
                                 TEXT,
                             );
                         }
-                        if app.studio.step_rules[bar].contains_key(&((row * STEPS + step) as u8)) {
+                        if app.project.studio.step_rules[bar].contains_key(&((row * STEPS + step) as u8)) {
                             p.circle_stroke(
                                 rect.left_top() + vec2(5.0, 5.0),
                                 2.5,
@@ -378,11 +378,11 @@ pub(super) fn show(app: &mut App, ui: &mut Ui, state: &mut State) {
                             description.push_str(&format!(" · {count} recorded"));
                         }
                         if row >= 2 {
-                            let velocity = drum_velocity(app.studio.hits[bar][row - 2][step]);
+                            let velocity = drum_velocity(app.project.studio.hits[bar][row - 2][step]);
                             description.push_str(&format!(" · velocity {velocity}"));
                         } else if let Some(assignment) = match row {
-                            0 => app.studio.chops[bar][step].map(|pad| format!("Pad {}", pad + 1)),
-                            _ => app.studio.key_steps[bar][step].map(piano_note),
+                            0 => app.project.studio.chops[bar][step].map(|pad| format!("Pad {}", pad + 1)),
+                            _ => app.project.studio.key_steps[bar][step].map(piano_note),
                         } {
                             description.push_str(&format!(" · {assignment}"));
                         } else {
@@ -400,7 +400,7 @@ pub(super) fn show(app: &mut App, ui: &mut Ui, state: &mut State) {
                         }
                         if response.clicked() && modifiers.alt {
                             state.rule_cell = cell;
-                            app.sequence_tool = Some(Tool::Conditions);
+                            app.view.sequence_tool = Some(Tool::Conditions);
                             continue;
                         }
                         if response.secondary_clicked() {
@@ -413,7 +413,7 @@ pub(super) fn show(app: &mut App, ui: &mut Ui, state: &mut State) {
                                 edits.push(Edit::Toggle(cell));
                             }
                         } else {
-                            let current = drum_velocity(app.studio.hits[bar][row - 2][step]);
+                            let current = drum_velocity(app.project.studio.hits[bar][row - 2][step]);
                             let visible = rect.intersect(ui.clip_rect());
                             let inside = response.enabled()
                                 && pointer_at.is_some_and(|pos| visible.contains(pos));
@@ -436,7 +436,7 @@ pub(super) fn show(app: &mut App, ui: &mut Ui, state: &mut State) {
                             if response.clicked() {
                                 state.velocity_cell = Some(cell);
                                 if modifiers.command {
-                                    app.sequence_tool = Some(Tool::Velocity);
+                                    app.view.sequence_tool = Some(Tool::Velocity);
                                 } else if !response.clicked_by(egui::PointerButton::Primary) {
                                     edits.push(Edit::Toggle(cell));
                                 }
@@ -465,7 +465,7 @@ pub(super) fn lane_timing(app: &mut App, ui: &mut Ui) {
                 .selected_text(lane_name(lane))
                 .show_ui(ui, |ui| {
                     for row in 0..LANES {
-                        let offset = app.studio.lane_offsets[row];
+                        let offset = app.project.studio.lane_offsets[row];
                         ui.selectable_value(
                             &mut lane,
                             row,
@@ -473,7 +473,7 @@ pub(super) fn lane_timing(app: &mut App, ui: &mut Ui) {
                         );
                     }
                 });
-            let old = app.studio.lane_offsets[lane];
+            let old = app.project.studio.lane_offsets[lane];
             let mut offset = old;
             let limit = crate::model::MAX_LANE_OFFSET;
             let timing = ui.add(
@@ -483,7 +483,7 @@ pub(super) fn lane_timing(app: &mut App, ui: &mut Ui) {
                     .suffix(" ticks"),
             );
             named_number(timing, "Lane timing offset in ticks", f64::from(offset));
-            let milliseconds = f64::from(offset) * 60_000.0 / (f64::from(app.studio.bpm) * 480.0);
+            let milliseconds = f64::from(offset) * 60_000.0 / (f64::from(app.project.studio.bpm) * 480.0);
             small(ui, format!("{milliseconds:+.1} ms"));
             if action(ui, "Reset lane", offset != 0).clicked() {
                 offset = 0;
@@ -491,7 +491,7 @@ pub(super) fn lane_timing(app: &mut App, ui: &mut Ui) {
             if action(
                 ui,
                 "Reset all lanes",
-                app.studio.lane_offsets.iter().any(|&offset| offset != 0),
+                app.project.studio.lane_offsets.iter().any(|&offset| offset != 0),
             )
             .clicked()
             {
@@ -528,7 +528,7 @@ impl State {
             ui.add(DragValue::new(&mut step).range(1..=STEPS).prefix("Step "));
             cell.step = step - 1;
             let key = (cell.lane * STEPS + cell.step) as u8;
-            let old = app.studio.step_rules[bar]
+            let old = app.project.studio.step_rules[bar]
                 .get(&key)
                 .copied()
                 .unwrap_or_default();
@@ -563,8 +563,8 @@ impl State {
             if rule != old {
                 edits.push(Edit::Condition(*cell, rule));
             }
-            if app.studio.step_has_hit(bar, cell.lane, cell.step) {
-                let old = app.studio.step_feel[bar]
+            if app.project.studio.step_has_hit(bar, cell.lane, cell.step) {
+                let old = app.project.studio.step_feel[bar]
                     .get(&key)
                     .copied()
                     .unwrap_or_default();
@@ -596,7 +596,7 @@ impl State {
                 if feel != old {
                     edits.push(Edit::Feel(*cell, feel));
                 }
-                let mut sound = app.studio.step_sounds[bar]
+                let mut sound = app.project.studio.step_sounds[bar]
                     .get(&key)
                     .copied()
                     .unwrap_or_default();
@@ -624,7 +624,7 @@ pub(super) fn velocity(app: &mut App, ui: &mut Ui, cell: Cell) {
                 cell.step + 1
             ),
         );
-        let mut velocity = drum_velocity(app.studio.hits[app.bar][cell.lane - 2][cell.step]);
+        let mut velocity = drum_velocity(app.project.studio.hits[app.bar][cell.lane - 2][cell.step]);
         if ui
             .add(
                 DragValue::new(&mut velocity)

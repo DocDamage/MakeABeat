@@ -2,7 +2,8 @@ use super::{App, Job};
 use crate::{
     analysis_jobs::{Priority, Queue},
     audio::{Clip, Command},
-    files::{self, Project},
+    files,
+    model::project::Project,
     model::{ExtractionOrigin, Record, Source},
     separation::sam::{self, Part, Span},
 };
@@ -90,7 +91,7 @@ impl App {
         let Ok(span) = self.extraction_span() else {
             return;
         };
-        let source = self.active_source;
+        let source = self.media.active_source();
         let Some(clip) = self.source_arc(source) else {
             return;
         };
@@ -126,7 +127,7 @@ impl App {
     fn extraction_matches(&self) -> bool {
         self.extraction.request.as_ref().is_some_and(|request| {
             Arc::ptr_eq(&request.project, &self.session.current)
-                && request.source == self.active_source
+                && request.source == self.media.active_source()
                 && self
                     .active_clip()
                     .is_some_and(|clip| Arc::ptr_eq(&request.clip.frames, &clip.frames))
@@ -181,7 +182,7 @@ impl App {
 
     pub fn preview_extraction(&mut self, part: Part) {
         if !self.extraction_ready()
-            || self.output.is_none()
+            || self.audio.output().is_none()
             || self.recording
             || self.input_recording.is_some()
         {
@@ -202,7 +203,7 @@ impl App {
         self.extraction_ready()
             && self.can_add_source()
             && !self.recording
-            && self.studio.sources.len() + 1 + count <= crate::model::MAX_SOURCES
+            && self.project.studio.sources.len() + 1 + count <= crate::model::MAX_SOURCES
             && self.project_frame_count()
                 + self.extraction.outputs.as_ref().unwrap()[1].frames.len() * count
                 <= files::MAX_PROJECT_FRAMES
@@ -218,7 +219,7 @@ impl App {
         self.sync_source_ids();
         let request = self.extraction.request.take().unwrap();
         let outputs = self.extraction.outputs.take().unwrap();
-        let parent_id = self.source_ids[request.source].0;
+        let parent_id = self.project.source_ids[request.source].0;
         let parent_title = self
             .source_record(request.source)
             .map_or("Source audio", |record| &record.title)
@@ -272,22 +273,25 @@ mod tests {
     };
 
     fn select(app: &mut App, clip: Clip) {
-        app.set_record(
-            Some(Record {
-                title: "Parent".into(),
-                artist: String::new(),
-                genre: String::new(),
-                source: Source::Generated(42),
-                release: None,
-            }),
+        app.replace_project(
+            Project {
+                record: Some(Record {
+                    title: "Parent".into(),
+                    artist: String::new(),
+                    genre: String::new(),
+                    source: Source::Generated(42),
+                    release: None,
+                }),
+                ..Default::default()
+            },
             Some(clip),
-            Default::default(),
+            false,
         );
-        app.studio.loop_in = Some(0.15);
-        app.studio.loop_out = Some(1.65);
+        app.project.studio.loop_in = Some(0.15);
+        app.project.studio.loop_out = Some(1.65);
         app.extraction.prompt = "bass guitar".into();
         app.observe_edits(false);
-        app.session.reset(app.project_snapshot(), None, None);
+        app.session.reset(app.project.clone(), None, None);
     }
 
     #[test]
@@ -305,11 +309,11 @@ mod tests {
         });
         app.extraction.outputs = Some([clip.clone(), clip.clone(), clip]);
         assert!(app.extraction_ready());
-        app.studio.loop_out = Some(1.7);
+        app.project.studio.loop_out = Some(1.7);
         assert!(!app.extraction_ready());
         app.save_extraction(&[Part::Target]);
         app.poll_extraction();
-        assert!(app.extraction.outputs.is_none() && app.studio.sources.is_empty());
+        assert!(app.extraction.outputs.is_none() && app.project.studio.sources.is_empty());
     }
 
     fn wait_for_worker(app: &mut App, timeout: Duration) {
@@ -336,11 +340,11 @@ mod tests {
         assert!(clip.duration() >= 4.0);
         select(&mut app, clip);
         // At 44.1 kHz this selection exercises TorchAudio's off-by-one resampling case.
-        app.studio.loop_out = Some(156_736.0 / 44_100.0);
+        app.project.studio.loop_out = Some(156_736.0 / 44_100.0);
         app.observe_edits(false);
-        app.session.reset(app.project_snapshot(), None, None);
+        app.session.reset(app.project.clone(), None, None);
         let span = app.extraction_span()?;
-        let before = app.project_snapshot();
+        let before = app.project.clone();
         app.start_extraction();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !app
@@ -354,14 +358,13 @@ mod tests {
         thread::sleep(Duration::from_millis(250));
         app.clear_extraction();
         wait_for_worker(&mut app, Duration::from_secs(5));
-        assert!(!app.extraction_ready() && app.project_snapshot() == before);
+        assert!(!app.extraction_ready() && app.project.clone() == before);
 
         app.start_extraction();
         wait_for_worker(&mut app, Duration::from_secs(125));
         assert!(app.extraction_ready(), "{:?}", app.extraction.status);
         let meters = app
-            .output
-            .as_ref()
+            .audio.output()
             .ok_or("No Windows audio output")?
             .meters
             .clone();
@@ -379,10 +382,10 @@ mod tests {
             }
             assert!(!meters.listening());
         }
-        assert!(app.project_snapshot() == before);
+        assert!(app.project.clone() == before);
         assert!(!app.can_undo_project(false));
         app.save_extraction(&[Part::Target, Part::Residual]);
-        let after = app.project_snapshot();
+        let after = app.project.clone();
         assert_eq!(after.studio.sources.len(), 2);
         for (index, record) in after.studio.sources.iter().enumerate() {
             let Source::Extracted(origin) = &record.source else {
@@ -397,15 +400,15 @@ mod tests {
         }
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("extraction.flip");
-        files::save_project(&path, &after, app.clip.as_deref())?;
+        files::save_project(&path, &after, app.media.root_clip())?;
         assert_eq!(&std::fs::read(&path)?[..8], b"LSFLIP09");
         let (reopened, audio) = files::open_project(&path)?;
         assert!(reopened == after);
         assert_eq!(audio.unwrap().sources.len(), 2);
         app.undo_project(false);
-        assert!(app.project_snapshot() == before);
+        assert!(app.project.clone() == before);
         app.undo_project(true);
-        assert!(app.project_snapshot() == after);
+        assert!(app.project.clone() == after);
         Ok(())
     }
 }

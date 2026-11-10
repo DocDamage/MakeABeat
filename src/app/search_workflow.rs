@@ -2,7 +2,8 @@ use super::{App, Job, Page};
 use crate::{
     analysis_jobs::{Priority, Queue},
     audio::Clip,
-    files::{self, Project},
+    files,
+    model::project::Project,
     library_index::{Cut, Index, Summary},
     model::{MAX_NAMED_SAMPLES, MAX_SAMPLE_NAME, NamedSample, Record, Source},
     search::{self, Filters, Hit, Query},
@@ -63,7 +64,7 @@ impl App {
     }
 
     pub fn open_search(&mut self) {
-        self.page = Page::Search;
+        self.view.page = Page::Search;
         if !self.search.initialized {
             self.search.initialized = true;
             self.refresh_search_summary();
@@ -153,12 +154,12 @@ impl App {
 
     pub fn index_search_cuts(&mut self) {
         let cuts: Vec<_> = self
-            .samples
+            .project.samples
             .iter()
             .filter_map(|sample| {
                 let clip = self.source_arc(sample.source)?;
                 let bpm = self
-                    .studio
+                    .project.studio
                     .beat_maps
                     .get(&sample.source)
                     .and_then(|map| crate::groove::loop_beats(map, sample.range(), 8))
@@ -269,7 +270,7 @@ impl App {
     }
 
     pub fn search_similar_cut(&mut self, index: usize) {
-        let Some(cut) = self.samples.get(index) else {
+        let Some(cut) = self.project.samples.get(index) else {
             return;
         };
         let Some(clip) = self.source_arc(cut.source) else {
@@ -323,7 +324,7 @@ impl App {
             return;
         }
         if matches!(action, UseHit::Audition) {
-            let project_sources: Vec<_> = (0..=self.studio.sources.len())
+            let project_sources: Vec<_> = (0..=self.project.studio.sources.len())
                 .filter_map(|index| {
                     Some((
                         index,
@@ -462,18 +463,18 @@ impl App {
             release: hit.location.origin.and_then(|record| record.release),
         };
         match action {
-            UseHit::Assign(pad) if self.studio.pads[pad].is_none() => {
+            UseHit::Assign(pad) if self.project.studio.pads[pad].is_none() => {
                 self.apply_job(Job::SourceAdded(record, clip, Some(pad)))
             }
-            UseHit::Save if self.samples.len() < MAX_NAMED_SAMPLES => {
+            UseHit::Save if self.project.samples.len() < MAX_NAMED_SAMPLES => {
                 self.apply_job(Job::SourceAdded(record, clip, None));
-                self.samples.push(NamedSample {
-                    source: self.active_source,
+                self.project.samples.push(NamedSample {
+                    source: self.media.active_source(),
                     name,
                     start: 0.0,
                     end: duration,
                 });
-                self.selected_sample = Some(self.samples.len() - 1);
+                self.selected_sample = Some(self.project.samples.len() - 1);
                 self.persist_samples();
             }
             _ => return,

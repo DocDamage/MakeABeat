@@ -35,7 +35,7 @@ pub(crate) struct Dialog {
 impl Dialog {
     pub fn new(app: &App) -> Self {
         Self {
-            pattern_only: app.studio.sections.is_empty(),
+            pattern_only: app.project.studio.sections.is_empty(),
             format: Format::Wave,
             wav: WavOptions::default(),
             midi: Default::default(),
@@ -64,7 +64,7 @@ impl Dialog {
                 close = action(ui, "Close", true).clicked();
                 return;
             }
-            let has_song = !app.studio.sections.is_empty();
+            let has_song = !app.project.studio.sections.is_empty();
             self.pattern_only |= !has_song;
             ui.horizontal_wrapped(|ui| {
                 ui.label("Export range");
@@ -80,9 +80,9 @@ impl Dialog {
                 }
             });
             let bars = if self.pattern_only {
-                app.studio.bars
+                app.project.studio.bars
             } else {
-                app.studio.song_bars()
+                app.project.studio.song_bars()
             };
             if matches!(self.format, Format::Wave | Format::Cut | Format::Daw) {
                 ui.horizontal_wrapped(|ui| {
@@ -123,7 +123,7 @@ impl Dialog {
                     small(ui, range.map_or_else(|| "Select a pad or waveform range first.".into(),
                         |(start, end)| format!("Source range · {:.3} seconds", end - start)));
                 } else {
-                    let seconds = 240.0 * bars as f64 / f64::from(app.studio.bpm) + f64::from(self.wav.tail_seconds);
+                    let seconds = 240.0 * bars as f64 / f64::from(app.project.studio.bpm) + f64::from(self.wav.tail_seconds);
                     small(ui, format!("{bars} bars · {seconds:.2} seconds with tail"));
                 }
             } else {
@@ -132,11 +132,11 @@ impl Dialog {
                     "MIDI contains trigger notes and tempo. Use a DAW pack for the audio.",
                 );
             }
-            if matches!(self.format, Format::Midi | Format::Daw) && app.studio.uses_transcription() {
+            if matches!(self.format, Format::Midi | Format::Daw) && app.project.studio.uses_transcription() {
                 midi_mode(ui, &mut self.midi);
             }
-            let has_notes = app.studio.has_pattern() || (!self.pattern_only && has_song);
-            let has_audio = has_notes || app.studio.active_loop().is_some();
+            let has_notes = app.project.studio.has_pattern() || (!self.pattern_only && has_song);
+            let has_audio = has_notes || app.project.studio.active_loop().is_some();
             let ready = app.busy.is_none() && (1..=crate::model::MAX_SONG_BARS).contains(&bars);
             ui.horizontal(|ui| {
                 match self.format {
@@ -161,7 +161,7 @@ impl Dialog {
                         if primary(
                             ui,
                             "Choose destinations…",
-                            ready && (has_audio || app.clip.is_some()),
+                            ready && (has_audio || app.media.root().is_some()),
                         )
                         .clicked() =>
                     {
@@ -191,12 +191,12 @@ impl Dialog {
             if action(ui, "Prepare raw cut", ready && selection.is_some()).clicked()
                 && let Some(range) = selection
             {
-                app.prepare_drag_export(Export::Selection { source: app.active_source, range }, wav);
+                app.prepare_drag_export(Export::Selection { source: app.media.active_source(), range }, wav);
             }
             if action(ui, "Prepare processed pad", ready && app.pad_range(app.selected_pad).is_some()).clicked() {
                 app.prepare_drag_export(Export::Pad(app.selected_pad), wav);
             }
-            if action(ui, "Prepare pattern", ready && (app.studio.has_pattern() || app.studio.active_loop().is_some())).clicked() {
+            if action(ui, "Prepare pattern", ready && (app.project.studio.has_pattern() || app.project.studio.active_loop().is_some())).clicked() {
                 app.prepare_drag_export(Export::Pattern, wav);
             }
         });

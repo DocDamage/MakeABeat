@@ -108,7 +108,7 @@ impl App {
     }
 
     pub(super) fn poll_taste(&mut self) {
-        if self.page == Page::Queue && !self.taste.initialized {
+        if self.view.page == Page::Queue && !self.taste.initialized {
             self.taste.initialized = true;
             self.invalidate_taste();
         }
@@ -119,7 +119,7 @@ impl App {
             self.taste.local_index_unavailable = unavailable;
         }
         if !self.taste_applied()
-            || self.page != Page::Queue
+            || self.view.page != Page::Queue
             || self
                 .taste
                 .requested
@@ -205,13 +205,12 @@ impl App {
 
     pub(super) fn taste_waiting(&self) -> bool {
         self.taste.jobs.current().is_some()
-            || (self.page == Page::Queue && self.taste_applied() && self.taste.requested.is_some())
+            || (self.view.page == Page::Queue && self.taste_applied() && self.taste.requested.is_some())
     }
 
     pub(super) fn poll_taste_listening(&mut self) {
         let heard = self
-            .output
-            .as_ref()
+            .audio.output()
             .filter(|_| self.library.taste.enabled)
             .and_then(|output| {
                 if output.meters.listening()

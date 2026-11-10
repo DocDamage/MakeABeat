@@ -238,12 +238,12 @@ impl Action {
             {
                 "Load a source first."
             }
-            Self::Preview | Self::Pattern | Self::Stop | Self::Song if app.output.is_none() => {
+            Self::Preview | Self::Pattern | Self::Stop | Self::Song if app.audio.output().is_none() => {
                 "Connect an audio output first."
             }
             Self::Song
                 if app.song_playing.is_none()
-                    && !(1..=crate::model::MAX_SONG_BARS).contains(&app.studio.song_bars()) =>
+                    && !(1..=crate::model::MAX_SONG_BARS).contains(&app.project.studio.song_bars()) =>
             {
                 "Arrange a playable song first."
             }
@@ -274,10 +274,10 @@ impl Action {
             {
                 "Select at most three minutes of audio."
             }
-            Self::PianoRoll if !source && app.studio.performance.is_empty() => {
+            Self::PianoRoll if !source && app.project.studio.performance.is_empty() => {
                 "Load a source or record a performance first."
             }
-            Self::ExportMidi if !app.studio.has_pattern() && app.studio.sections.is_empty() => {
+            Self::ExportMidi if !app.project.studio.has_pattern() && app.project.studio.sections.is_empty() => {
                 "Add pattern notes or arrange a song first."
             }
             Self::IndexFolder if app.search_job().is_some() => {
@@ -314,7 +314,7 @@ impl Action {
             Self::Song => app.play_song(),
             Self::Stop => app.stop_all(),
             Self::Page(Page::Search) => app.open_search(),
-            Self::Page(page) => app.page = page,
+            Self::Page(page) => app.view.page = page,
             Self::Studio(view) => open_studio(app, view),
             Self::Sample(tool) => open_sample_tool(app, tool),
             Self::AddSource => app.add_source(),
@@ -341,7 +341,7 @@ impl Action {
                 open_studio(app, StudioView::Sequence);
                 app.drum_templates = Some(drum_templates::Browser::default());
             }
-            Self::PianoRoll => app.piano_roll = Some(piano_roll::PianoRoll::new(app)),
+            Self::PianoRoll => app.view.piano_roll = Some(piano_roll::PianoRoll::new(app)),
             Self::IndexFolder => {
                 app.open_search();
                 app.index_search_folder();
@@ -359,16 +359,16 @@ impl Action {
 }
 
 fn open_studio(app: &mut App, view: StudioView) {
-    app.page = Page::Studio;
+    app.view.page = Page::Studio;
     if view == StudioView::Arrange {
         app.open_arrangement();
     } else {
-        app.arrangement_timeline.cancel_drag();
-        app.studio_view = view;
+        app.view.arrangement_timeline.cancel_drag();
+        app.view.studio_view = view;
     }
 }
 
 fn open_sample_tool(app: &mut App, tool: Tool) {
     open_studio(app, StudioView::Sample);
-    app.sample_tool = Some(tool);
+    app.view.sample_tool = Some(tool);
 }

@@ -1,6 +1,6 @@
 use super::{BLUE, DIM, EDGE, GOLD, INSET, MINT, TEXT, action, label, pill, primary, small};
 use crate::{
-    app::App,
+    app::{App, piano_roll_workflow::{Edit, NoteKey, Outcome, assigned, note_key}},
     audio::PadMode,
     model::{
         ChopInput, MAX_BARS, PIANO_HIGH, PIANO_LOW, PlayedChop, Quantize, STEPS, Studio,
@@ -11,17 +11,11 @@ use eframe::egui::{
     self, Align2, Color32, ComboBox, Context, DragValue, FontId, Key, Pos2, Rect, ScrollArea,
     Sense, Stroke, StrokeKind, Ui, pos2, vec2,
 };
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::BTreeSet;
 
 const LANE_HEIGHT: f32 = 19.0;
 const LABEL_WIDTH: f32 = 64.0;
 const CLIPBOARD_HEADER: &str = "Lost Samples piano roll v1\n";
-type NoteId = (u32, ChopInput);
-
-fn note_id(note: &PlayedChop) -> NoteId {
-    (note.tick, note.input)
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Track {
     Pads,
@@ -65,13 +59,6 @@ fn input_name(input: ChopInput) -> String {
     }
 }
 
-fn assigned(studio: &Studio, input: ChopInput, duration: f64) -> bool {
-    match input {
-        ChopInput::Pad(pad) => studio.slice(usize::from(pad), duration).is_some(),
-        ChopInput::Key(note) => studio.key_range(note, duration).is_some(),
-    }
-}
-
 #[derive(Clone, Copy)]
 enum Gesture {
     Select {
@@ -79,12 +66,12 @@ enum Gesture {
     },
     Move {
         start: Pos2,
-        note: NoteId,
+        note: NoteKey,
         additive: bool,
     },
     Resize {
         start: Pos2,
-        note: NoteId,
+        note: NoteKey,
     },
     Draw,
 }
@@ -110,7 +97,7 @@ impl View {
         (pixels * self.ticks_visible as f32 / self.grid().width()).round() as i64
     }
 
-    fn hit(&self, pos: Pos2, grid: Quantize, swing: f32) -> Option<NoteId> {
+    fn hit(&self, pos: Pos2, grid: Quantize, swing: f32) -> Option<NoteKey> {
         if !self.grid().contains(pos) {
             return None;
         }
@@ -218,7 +205,7 @@ pub(crate) struct PianoRoll {
     draw: bool,
     snap_draw: bool,
     draw_gate: bool,
-    selection: BTreeSet<NoteId>,
+    selection: BTreeSet<NoteKey>,
     gesture: Option<Gesture>,
     focus_row: Option<usize>,
     velocity: u8,
@@ -241,10 +228,10 @@ impl PianoRoll {
             human_ticks: 8,
             human_velocity: 6,
             draw: !app
-                .studio
+                .project.studio
                 .roll_notes()
                 .iter()
-                .any(|note| note.tick < app.studio.pattern_ticks()),
+                .any(|note| note.tick < app.project.studio.pattern_ticks()),
             snap_draw: true,
             draw_gate: false,
             selection: BTreeSet::new(),
@@ -261,15 +248,15 @@ impl PianoRoll {
             Track::Pads
         };
         let available = |track| {
-            app.studio.roll_notes().iter().any(|note| {
-                note.tick < app.studio.pattern_ticks() && Track::of(note.input) == track
+            app.project.studio.roll_notes().iter().any(|note| {
+                note.tick < app.project.studio.pattern_ticks() && Track::of(note.input) == track
             })
         };
         let track = [preferred, Track::Pads, Track::Keys]
             .into_iter()
             .find(|&track| available(track))
             .unwrap_or(preferred);
-        roll.show_track(&app.studio, track);
+        roll.show_track(&app.project.studio, track);
         roll
     }
 
@@ -302,7 +289,7 @@ impl PianoRoll {
             self.focus_row = Some(Track::row(note.input));
         } else {
             self.focus_row = (0..self.track.rows())
-                .find(|&row| assigned(studio, self.track.input(row), f64::INFINITY))
+                .find(|&row| assigned(studio, self.track.input(row)))
                 .or(Some(if self.track == Track::Pads {
                     0
                 } else {
@@ -311,80 +298,18 @@ impl PianoRoll {
         }
     }
 
-    fn apply(
-        &mut self,
-        notes: &mut Vec<PlayedChop>,
-        mut edit: impl FnMut(PlayedChop) -> Option<PlayedChop>,
-    ) {
-        if self.selection.is_empty() {
-            return;
-        }
-        let mut after = Vec::with_capacity(notes.len());
-        let mut selected = BTreeSet::new();
-        let mut ids = HashSet::with_capacity(notes.len());
-        self.message = None;
-        for note in notes.iter() {
-            let is_selected = self.selection.contains(&note_id(note));
-            let edited = if is_selected { edit(note.clone()) } else { Some(note.clone()) };
-            if let Some(edited) = edited {
-                let id = note_id(&edited);
-                if !ids.insert(id) {
-                    self.message = Some(
-                        "Two hits would share the same lane and start. Move one before applying the edit.".into(),
-                    );
-                    return;
-                }
-                if is_selected {
-                    selected.insert(id);
-                }
-                after.push(edited);
-            }
-        }
-        self.commit(notes, after, selected);
-    }
-
-    fn commit(
-        &mut self,
-        notes: &mut Vec<PlayedChop>,
-        mut after: Vec<PlayedChop>,
-        selected: BTreeSet<NoteId>,
-    ) {
-        after.sort_unstable_by_key(note_id);
-        if *notes != after {
-            *notes = after;
-            self.selection = selected;
-        }
-    }
-
-    fn insert(
-        &mut self,
-        notes: &mut Vec<PlayedChop>,
-        additions: impl IntoIterator<Item = PlayedChop>,
-    ) -> (usize, usize) {
-        let mut occupied: HashSet<_> = notes.iter().map(note_id).collect();
-        let mut after = notes.clone();
-        let mut selection = BTreeSet::new();
-        let mut skipped = 0;
-        for note in additions {
-            let id = note_id(&note);
-            if occupied.insert(id) {
-                after.push(note);
-                selection.insert(id);
-            } else {
-                skipped += 1;
-            }
-        }
-        let added = selection.len();
-        self.commit(notes, after, selection);
-        (added, skipped)
+    fn edit(&mut self, app: &mut App, edit: Edit<'_>, group: bool) -> Outcome {
+        let outcome = app.edit_piano_roll(edit, &mut self.selection, group);
+        self.message = outcome.message.map(str::to_owned);
+        outcome
     }
 
     fn copy_selected(&mut self, app: &mut App, ctx: &Context) {
         let mut copy: Vec<_> = app
-            .studio
+            .project.studio
             .roll_notes()
             .into_iter()
-            .filter(|note| self.selection.contains(&note_id(note)))
+            .filter(|note| self.selection.contains(&note_key(note)))
             .collect();
         let Some(first) = copy.first() else { return };
         let origin = first.tick / TICKS_PER_BAR * TICKS_PER_BAR;
@@ -407,25 +332,21 @@ impl PianoRoll {
             return;
         };
         let start = self.bar as u32 * TICKS_PER_BAR;
-        if app
-            .piano_roll_clipboard
-            .iter()
-            .any(|note| start + note.tick >= app.studio.pattern_ticks())
-        {
-            self.message = Some("Add more bars before pasting this selection.".into());
-            return;
-        }
         let track = Track::of(first.input);
         let additions = app.piano_roll_clipboard.iter().cloned().map(|note| PlayedChop {
             tick: start + note.tick,
             id: Default::default(),
             ..note
         });
-        let (added, skipped) = app.studio.edit_roll_notes(|notes| self.insert(notes, additions));
+        let outcome = self.edit(app, Edit::Paste(additions.collect()), false);
+        if outcome.message.is_some() {
+            return;
+        }
+        let (added, skipped) = (outcome.added, outcome.skipped);
         if added > 0 {
             self.track = track;
             self.focus_row = self.selection.first().map(|&(_, input)| Track::row(input));
-            self.refresh_fields(&app.studio);
+            self.refresh_fields(&app.project.studio);
         }
         self.message = Some(if skipped == 0 {
             format!(
@@ -444,7 +365,7 @@ impl PianoRoll {
         } else {
             Quantize::Off
         };
-        let (tick, input) = view.hit(pos, grid, app.studio.swing)?;
+        let (tick, input) = view.hit(pos, grid, app.project.studio.swing)?;
         Some(PlayedChop {
             id: Default::default(),
             tick,
@@ -457,50 +378,11 @@ impl PianoRoll {
             },
             length: self
                 .draw_gate
-                .then_some(self.hold_ticks.min(app.studio.pattern_ticks())),
+                .then_some(self.hold_ticks.min(app.project.studio.pattern_ticks())),
             sound: Default::default(),
             expression: None,
         })
     }
-
-    fn quantize(&mut self, studio: &mut Studio) {
-        let loop_ticks = u64::from(studio.pattern_ticks());
-        let swing = studio.swing;
-        let grid = self.grid;
-        let strength = f64::from(self.strength) / 100.0;
-        let occupied: HashSet<_> = studio.roll_notes().iter().map(note_id).collect();
-        let proposals: HashMap<_, _> = self
-            .selection
-            .iter()
-            .filter_map(|&(start, input)| {
-                let snapped = grid.snap(f64::from(start), swing) as f64;
-                let tick = (f64::from(start) + (snapped - f64::from(start)) * strength).round() as u64;
-                let tick = (tick % loop_ticks) as u32;
-                (tick != start).then_some(((start, input), (tick, input)))
-            })
-            .collect();
-        let mut count = HashMap::new();
-        for &destination in proposals.values() {
-            *count.entry(destination).or_insert(0) += 1;
-        }
-        let mut collision = false;
-        studio.edit_roll_notes(|notes| self.apply(notes, |mut note| {
-            if let Some(&target) = proposals.get(&note_id(&note)) {
-                if occupied.contains(&target) || count[&target] > 1 {
-                    collision = true;
-                } else {
-                    note.tick = target.0;
-                }
-            }
-            Some(note)
-         }));
-        if collision {
-            self.message = Some(
-                "Hits that would land together on the same lane kept their original timing.".into(),
-            );
-        }
-    }
-
 
     fn select_all(&mut self, studio: &Studio) {
         self.selection = studio
@@ -509,7 +391,7 @@ impl PianoRoll {
             .filter(|note| {
                 note.tick < studio.pattern_ticks() && Track::of(note.input) == self.track
             })
-            .map(note_id)
+            .map(note_key)
             .collect();
         self.refresh_fields(studio);
     }
@@ -518,7 +400,7 @@ impl PianoRoll {
         if let Some(note) = studio
             .roll_notes()
             .iter()
-            .find(|note| self.selection.contains(&note_id(note)))
+            .find(|note| self.selection.contains(&note_key(note)))
         {
             self.velocity = note.velocity;
             self.hold_ticks = note.length.unwrap_or(34);
@@ -527,13 +409,13 @@ impl PianoRoll {
 
     pub fn keys(app: &App) -> Self {
         let mut roll = Self::new(app);
-        roll.show_track(&app.studio, Track::Keys);
-        roll.transcription_sound = app.studio.performance.iter().find_map(|note| note.expression.as_ref().map(|expression| expression.instrument)).unwrap_or_default();
+        roll.show_track(&app.project.studio, Track::Keys);
+        roll.transcription_sound = app.project.studio.performance.iter().find_map(|note| note.expression.as_ref().map(|expression| expression.instrument)).unwrap_or_default();
         roll
     }
 
     pub fn show(&mut self, app: &mut App, ctx: &Context) -> bool {
-        self.bar = self.bar.min(app.studio.bars - 1);
+        self.bar = self.bar.min(app.project.studio.bars - 1);
         let mut close = false;
         let screen = ctx.screen_rect();
         let width = (screen.width() - 48.0).min(1090.0);
@@ -541,7 +423,7 @@ impl PianoRoll {
         let modal = super::responsive_modal(ctx, "piano_roll_modal", width, |ui| {
             ui.horizontal(|ui| {
                 ui.label(label("Piano roll", 22.0, TEXT).strong());
-                if action(ui, if app.playing { "Stop" } else { "Play" }, app.output.is_some()).clicked() {
+                if action(ui, if app.playing { "Stop" } else { "Play" }, app.audio.output().is_some()).clicked() {
                     app.toggle_pattern();
                 }
                 if action(ui, "Close", true).clicked() {
@@ -551,12 +433,12 @@ impl PianoRoll {
             ui.horizontal_wrapped(|ui| {
                 for (track, name) in [(Track::Pads, "Pads"), (Track::Keys, "Keys")] {
                     if pill(ui, name, self.track == track).clicked() && self.track != track {
-                        self.show_track(&app.studio, track);
+                        self.show_track(&app.project.studio, track);
                     }
                 }
                 let prior = self.bar;
                 ComboBox::from_id_salt("roll_bar").selected_text(format!("Bar {}", self.bar + 1)).show_ui(ui, |ui| {
-                    for bar in 0..app.studio.bars {
+                    for bar in 0..app.project.studio.bars {
                         ui.selectable_value(&mut self.bar, bar, format!("Bar {}", bar + 1));
                     }
                 });
@@ -568,12 +450,12 @@ impl PianoRoll {
                         }
                     });
                 if self.bar != prior {
-                    self.focus_lane(&app.studio, false);
+                    self.focus_lane(&app.project.studio, false);
                 }
-                if action(ui, "Add bar", app.studio.bars < MAX_BARS).clicked() {
-                    app.studio.insert_bar(app.studio.bars);
-                    self.bar = app.studio.bars - 1;
-                    self.focus_lane(&app.studio, false);
+                if action(ui, "Add bar", app.project.studio.bars < MAX_BARS).clicked() {
+                    app.project.studio.insert_bar(app.project.studio.bars);
+                    self.bar = app.project.studio.bars - 1;
+                    self.focus_lane(&app.project.studio, false);
                 }
                 if pill(ui, "Draw", self.draw).on_hover_text("Click an empty spot to add a hit. Turn Draw off to box-select.").clicked() {
                     self.draw = !self.draw;
@@ -586,12 +468,15 @@ impl PianoRoll {
                     self.paste(app);
                 }
                 if action(ui, "Select all", true).on_hover_text("Select this lane type across all bars").clicked() {
-                    self.select_all(&app.studio);
+                    self.select_all(&app.project.studio);
                 }
                 if action(ui, "Delete", !self.selection.is_empty()).clicked() {
-                    app.studio.edit_roll_notes(|notes| self.apply(notes, |_| None));
+                    self.edit(app, Edit::Delete, false);
                 }
-                super::project_history(app, ui);
+                if super::project_history(app, ui) {
+                    self.reset_selection();
+                    self.bar = self.bar.min(app.project.studio.bars - 1);
+                }
             });
             ui.horizontal_wrapped(|ui| {
                 small(ui, "Quantize grid");
@@ -602,28 +487,28 @@ impl PianoRoll {
                 });
                 ui.add(DragValue::new(&mut self.strength).range(0..=100).prefix("Strength ").suffix("%"));
                 if primary(ui, "Quantize selected", !self.selection.is_empty()).clicked() {
-                    self.quantize(&mut app.studio);
+                    self.edit(app, Edit::Quantize { grid: self.grid, strength: self.strength }, false);
                 }
                 ui.add_enabled_ui(self.draw || !self.selection.is_empty(), |ui| {
                     ui.add(DragValue::new(&mut self.velocity).range(1..=127).prefix("Velocity "));
                     if !self.draw && action(ui, "Apply velocity", true).clicked() {
                         let velocity = self.velocity;
-                        app.studio.edit_roll_notes(|notes| self.apply(notes, |mut note| { note.velocity = velocity; Some(note) }));
+                        self.edit(app, Edit::Velocity(velocity), ui.input(|input| input.pointer.primary_down()));
                     }
                 });
                 if self.draw {
                     ui.checkbox(&mut self.snap_draw, "Snap draw");
                     ui.checkbox(&mut self.draw_gate, "Gate");
                     if self.draw_gate {
-                        ui.add(DragValue::new(&mut self.hold_ticks).range(1..=app.studio.pattern_ticks()).prefix("Hold ").suffix(" ticks"));
+                        ui.add(DragValue::new(&mut self.hold_ticks).range(1..=app.project.studio.pattern_ticks()).prefix("Hold ").suffix(" ticks"));
                     }
                 } else if self.selection.len() == 1
-                    && app.studio.roll_notes().iter().any(|note| self.selection.contains(&note_id(note)) && note.mode == PadMode::Gate)
+                    && app.project.studio.roll_notes().iter().any(|note| self.selection.contains(&note_key(note)) && note.mode == PadMode::Gate)
                 {
-                    ui.add(DragValue::new(&mut self.hold_ticks).range(1..=app.studio.pattern_ticks()).prefix("Hold ").suffix(" ticks"));
+                    ui.add(DragValue::new(&mut self.hold_ticks).range(1..=app.project.studio.pattern_ticks()).prefix("Hold ").suffix(" ticks"));
                     if action(ui, "Apply hold", true).clicked() {
                         let length = self.hold_ticks;
-                        app.studio.edit_roll_notes(|notes| self.apply(notes, |mut note| { note.length = Some(length); Some(note) }));
+                        self.edit(app, Edit::Hold(length), false);
                     }
                 }
                 small(ui, format!("{} selected", self.selection.len()));
@@ -637,25 +522,24 @@ impl PianoRoll {
                         ui.add(DragValue::new(&mut self.human_ticks).range(0..=32).prefix("Timing ± ").suffix(" ticks"));
                         ui.add(DragValue::new(&mut self.human_velocity).range(0..=30).prefix("Velocity ± "));
                         if ui.button("Apply to selected notes").clicked() {
-                            self.humanize(&mut app.studio);
+                            self.edit(app, Edit::Humanize { ticks: self.human_ticks, velocity: self.human_velocity }, false);
                             ui.close_menu();
                         }
                     });
                 });
                 if let Some(&(tick, input)) = self.selection.first().filter(|_| self.selection.len() == 1) {
                     let mut at = tick;
-                    if ui.add(DragValue::new(&mut at).range(0..=app.studio.pattern_ticks() - 1).prefix("Start tick ")).changed() {
-                        app.studio.edit_roll_notes(|notes| self.apply(notes, |mut note| {
-                            if note_id(&note) == (tick, input) { note.tick = at; }
-                            Some(note)
-                        }));
+                    if ui.add(DragValue::new(&mut at).range(0..=app.project.studio.pattern_ticks() - 1).prefix("Start tick ")).changed() {
+                        let group = ui.input(|input| input.pointer.primary_down());
+                        self.edit(app, Edit::Start { note: (tick, input), tick: at }, group);
                     }
-                    if let Some(note) = app.studio.roll_notes().into_iter()
-                        .find(|note| note_id(note) == (tick, input))
+                    if let Some(note) = app.project.studio.roll_notes().into_iter()
+                        .find(|note| note_key(note) == (tick, input))
                     {
                         let mut sound = note.sound;
                         if super::layers::hit_sound(ui, &mut sound) {
-                            app.studio.set_roll_sound(tick, input, sound);
+                            let group = ui.input(|input| input.pointer.primary_down());
+                            self.edit(app, Edit::Sound { note: (tick, input), sound }, group);
                         }
                     }
                 }
@@ -663,7 +547,7 @@ impl PianoRoll {
             ui.collapsing("Select notes by name and time", |ui| {
                 let start = self.bar as u32 * TICKS_PER_BAR;
                 let end = start + self.bars_visible as u32 * TICKS_PER_BAR;
-                let notes: Vec<_> = app.studio.roll_notes().into_iter()
+                let notes: Vec<_> = app.project.studio.roll_notes().into_iter()
                     .filter(|note| (start..end).contains(&note.tick) && Track::of(note.input) == self.track)
                     .collect();
                 if notes.is_empty() {
@@ -671,7 +555,7 @@ impl PianoRoll {
                 }
                 ScrollArea::vertical().id_salt("accessible_notes").max_height(120.0).show(ui, |ui| {
                     for note in notes {
-                        let id = note_id(&note);
+                        let id = note_key(&note);
                         let mut selected = self.selection.contains(&id);
                         if ui.checkbox(&mut selected, format!("{} · bar {} · tick {} · velocity {}",
                             input_name(note.input), note.tick / TICKS_PER_BAR + 1,
@@ -683,7 +567,7 @@ impl PianoRoll {
                     }
                 });
             });
-            if self.track == Track::Keys && app.studio.performance.iter().any(|note| note.expression.is_some()) {
+            if self.track == Track::Keys && app.project.studio.performance.iter().any(|note| note.expression.is_some()) {
                 ui.collapsing("Transcribed phrase sound", |ui| {
                     ui.horizontal_wrapped(|ui| {
                         super::transcription::sound_picker(app, ui, &mut self.transcription_sound);
@@ -698,7 +582,7 @@ impl PianoRoll {
                 .auto_shrink([false, true]).drag_to_scroll(false);
             if let Some(row) = self.focus_row.take() {
                 let input = self.track.input(row.min(self.track.rows() - 1));
-                let row = self.displayed_lanes(&app.studio).iter().position(|lane| *lane == input).unwrap_or(0);
+                let row = self.displayed_lanes(&app.project.studio).iter().position(|lane| *lane == input).unwrap_or(0);
                 scroll = scroll.vertical_scroll_offset((row as f32 * self.lane_height - height * 0.35).max(0.0));
             }
             let view = scroll.show(ui, |ui| self.canvas(app, ui)).inner;
@@ -753,27 +637,33 @@ impl PianoRoll {
                 self.message = Some("Copy notes from the piano roll before pasting.".into());
             }
         }
-        let duration = f64::INFINITY;
-        let studio = &mut app.studio;
-        ctx.input_mut(|input| {
-            if input.consume_key(egui::Modifiers::COMMAND, Key::A) {
-                self.select_all(studio);
-            }
-            if input.consume_key(egui::Modifiers::NONE, Key::Delete) {
-                studio.edit_roll_notes(|notes| self.apply(notes, |_| None));
-            }
+        let (select_all, delete, ticks) = ctx.input_mut(|input| {
+            let select_all = input.consume_key(egui::Modifiers::COMMAND, Key::A);
+            let delete = input.consume_key(egui::Modifiers::NONE, Key::Delete);
             let modifiers = if input.modifiers.shift {
                 egui::Modifiers::SHIFT
             } else {
                 egui::Modifiers::NONE
             };
-            let ticks = if modifiers.shift { 10 } else { 1 };
-            if input.consume_key(modifiers, Key::ArrowLeft) {
-                self.move_notes(studio, duration, -ticks, 0, None);
+            let step = if modifiers.shift { 10 } else { 1 };
+            let ticks = if input.consume_key(modifiers, Key::ArrowLeft) {
+                -step
             } else if input.consume_key(modifiers, Key::ArrowRight) {
-                self.move_notes(studio, duration, ticks, 0, None);
-            }
+                step
+            } else {
+                0
+            };
+            (select_all, delete, ticks)
         });
+        if select_all {
+            self.select_all(&app.project.studio);
+        }
+        if delete {
+            self.edit(app, Edit::Delete, false);
+        }
+        if ticks != 0 {
+            self.edit(app, Edit::Move { ticks, rows: 0, lanes: &[] }, false);
+        }
     }
 
     fn displayed_lanes(&self, studio: &Studio) -> Vec<ChopInput> {
@@ -782,54 +672,34 @@ impl PianoRoll {
                 || studio.performance.iter().any(|note| note.input == input && note.expression.is_some())).collect()
     }
 
-    fn humanize(&mut self, studio: &mut Studio) {
-        let original = studio.roll_notes();
-        let mut occupied: HashSet<_> = original.iter().map(note_id).collect();
-        let timing = i32::from(self.human_ticks);
-        let velocity = i32::from(self.human_velocity);
-        let limit = studio.pattern_ticks() - 1;
-        studio.edit_roll_notes(|notes| self.apply(notes, |mut note| {
-            let lane = Track::row(note.input) as u32;
-            let seed = note.tick.wrapping_mul(0x9e37_79b9).wrapping_add(lane.wrapping_mul(0x85eb_ca6b));
-            let jitter = |seed: u32, range: i32| (seed % (2 * range + 1) as u32) as i32 - range;
-            let tick = note.tick.saturating_add_signed(jitter(seed, timing)).min(limit);
-            if !occupied.contains(&(tick, note.input)) {
-                occupied.insert((tick, note.input));
-                note.tick = tick;
-            }
-            note.velocity = (i32::from(note.velocity) + jitter(seed.rotate_left(13), velocity)).clamp(1, 127) as u8;
-            Some(note)
-        }));
-    }
-
     fn draw_velocity_lane(&mut self, app: &mut App, ui: &mut Ui, view: &View) {
         let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 52.0), Sense::click_and_drag());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 3.0, INSET);
         painter.text(rect.left_center() + vec2(4.0, 0.0), Align2::LEFT_CENTER, "Velocity", FontId::monospace(10.0), DIM);
-        let notes: Vec<_> = app.studio.roll_notes().into_iter().filter(|note| {
+        let notes: Vec<_> = app.project.studio.roll_notes().into_iter().filter(|note| {
             view.lanes.contains(&note.input) && (view.start..view.start + view.ticks_visible).contains(&note.tick)
         }).collect();
         for note in &notes {
             let x = view.x(note.tick);
             let top = rect.bottom() - f32::from(note.velocity) / 127.0 * (rect.height() - 4.0);
-            let tint = if self.selection.contains(&note_id(note)) { GOLD } else { MINT };
+            let tint = if self.selection.contains(&note_key(note)) { GOLD } else { MINT };
             painter.vline(x, top..=rect.bottom(), Stroke::new(2.0_f32, tint));
         }
         if (response.clicked() || response.dragged()) && let Some(pos) = response.interact_pointer_pos() {
             let target = notes.iter().filter(|note| (view.x(note.tick) - pos.x).abs() < 11.0)
-                .min_by_key(|note| (!self.selection.contains(&note_id(note)), ((view.x(note.tick) - pos.x).abs() * 10.0) as u32));
+                .min_by_key(|note| (!self.selection.contains(&note_key(note)), ((view.x(note.tick) - pos.x).abs() * 10.0) as u32));
             if let Some(note) = target {
-                self.selection = BTreeSet::from([note_id(note)]);
+                self.selection = BTreeSet::from([note_key(note)]);
                 let velocity = ((rect.bottom() - pos.y) / rect.height() * 127.0).round().clamp(1.0, 127.0) as u8;
-                app.studio.edit_roll_notes(|notes| self.apply(notes, |mut note| { note.velocity = velocity; Some(note) }));
+                self.edit(app, Edit::Velocity(velocity), ui.input(|input| input.pointer.primary_down()));
                 self.velocity = velocity;
             }
         }
     }
 
     fn canvas(&mut self, app: &mut App, ui: &mut Ui) -> View {
-        let lanes = self.displayed_lanes(&app.studio);
+        let lanes = self.displayed_lanes(&app.project.studio);
         if lanes.is_empty() { small(ui, "No assigned lanes. Assign a pad or key, or turn off Assigned lanes."); }
         let (rect, response) = ui.allocate_exact_size(
             vec2(ui.available_width(), lanes.len().max(1) as f32 * self.lane_height),
@@ -841,12 +711,11 @@ impl PianoRoll {
             start: self.bar as u32 * TICKS_PER_BAR,
             lanes,
             lane_height: self.lane_height,
-            ticks_visible: self.bars_visible.min(app.studio.bars - self.bar) as u32 * TICKS_PER_BAR,
+            ticks_visible: self.bars_visible.min(app.project.studio.bars - self.bar) as u32 * TICKS_PER_BAR,
         };
-        let duration = f64::INFINITY;
         let pointer = ui.input(|input| input.pointer.interact_pos());
         let notes: Vec<_> = app
-            .studio
+            .project.studio
             .roll_notes()
             .into_iter()
             .filter(|note| Track::of(note.input) == self.track)
@@ -860,7 +729,7 @@ impl PianoRoll {
             let shift = ui.input(|input| input.modifiers.shift);
             self.message = None;
             if let Some((note, rect)) = hovered {
-                let id = note_id(note);
+                let id = note_key(note);
                 if shift && self.selection.remove(&id) {
                     self.gesture = None;
                 } else {
@@ -895,7 +764,7 @@ impl PianoRoll {
                 self.gesture = Some(Gesture::Select { start: pos });
             }
             if !matches!(self.gesture, Some(Gesture::Draw)) {
-                self.refresh_fields(&app.studio);
+                self.refresh_fields(&app.project.studio);
             }
         }
         let released = ui.input(|input| !input.pointer.primary_down());
@@ -910,18 +779,16 @@ impl PianoRoll {
                         notes
                             .iter()
                             .filter(|(_, rect)| area.intersects(*rect))
-                            .map(|(note, _)| note_id(note)),
+                            .map(|(note, _)| note_key(note)),
                     );
-                    self.refresh_fields(&app.studio);
+                    self.refresh_fields(&app.project.studio);
                 }
                 Gesture::Move { start, .. } if start.distance(pos) >= 3.0 => {
-                    self.move_notes(
-                        &mut app.studio,
-                        duration,
-                        view.ticks(pos.x - start.x),
-                        ((pos.y - start.y) / self.lane_height).round() as i32,
-                        Some(&view.lanes),
-                    );
+                    self.edit(app, Edit::Move {
+                        ticks: view.ticks(pos.x - start.x),
+                        rows: ((pos.y - start.y) / self.lane_height).round() as i32,
+                        lanes: &view.lanes,
+                    }, false);
                 }
                 Gesture::Move {
                     note,
@@ -929,32 +796,17 @@ impl PianoRoll {
                     ..
                 } => {
                     self.selection = BTreeSet::from([note]);
-                    self.refresh_fields(&app.studio);
+                    self.refresh_fields(&app.project.studio);
                 }
                 Gesture::Resize { start, note } if (start.x - pos.x).abs() >= 3.0 => {
-                    let max = i64::from(app.studio.pattern_ticks());
-                    let delta = view.ticks(pos.x - start.x);
-                    app.studio.edit_roll_notes(|notes| self.apply(notes, |mut event| {
-                        if note_id(&event) == note {
-                            event.length = Some(
-                                (i64::from(event.length.unwrap_or(34)) + delta).clamp(1, max)
-                                    as u32,
-                            );
-                        }
-                        Some(event)
-                     }));
-                    self.refresh_fields(&app.studio);
+                    self.edit(app, Edit::Resize { note, delta: view.ticks(pos.x - start.x) }, false);
+                    self.refresh_fields(&app.project.studio);
                 }
                 Gesture::Draw => {
                     if hovered.is_none()
                         && let Some(note) = self.draw_note(app, &view, pos)
                     {
-                        if !assigned(&app.studio, note.input, duration) {
-                            self.message =
-                                Some("Assign a chop to this lane before drawing hits.".into());
-                        } else if app.studio.edit_roll_notes(|notes| self.insert(notes, [note])).1 > 0 {
-                            self.message = Some("A hit already starts here on this lane.".into());
-                        }
+                        self.edit(app, Edit::Draw(note), false);
                     }
                 }
                 _ => (),
@@ -981,7 +833,7 @@ impl PianoRoll {
                     Align2::LEFT_CENTER,
                     input_name(input),
                     FontId::monospace(11.0),
-                    if assigned(&app.studio, input, duration) {
+                    if assigned(&app.project.studio, input) {
                         TEXT
                     } else {
                         DIM
@@ -996,9 +848,9 @@ impl PianoRoll {
             }
         }
         for step in 0..=visible_steps {
-            let tick = view.start + swung_step(step as u64, app.studio.swing) as u32;
+            let tick = view.start + swung_step(step as u64, app.project.studio.swing) as u32;
             if self.grid == Quantize::ThirtySecond && step < visible_steps {
-                let next = view.start + swung_step(step as u64 + 1, app.studio.swing) as u32;
+                let next = view.start + swung_step(step as u64 + 1, app.project.studio.swing) as u32;
                 painter.vline(
                     view.x((tick + next) / 2),
                     rect.y_range(),
@@ -1015,7 +867,7 @@ impl PianoRoll {
             .step
             .filter(|step| app.song_playing.is_none() && step / STEPS == self.bar)
         {
-            let tick = view.start + swung_step((step % STEPS) as u64, app.studio.swing) as u32;
+            let tick = view.start + swung_step((step % STEPS) as u64, app.project.studio.swing) as u32;
             painter.vline(
                 view.x(tick),
                 rect.y_range(),
@@ -1023,7 +875,7 @@ impl PianoRoll {
             );
         }
         for &(ref note, hit) in &notes {
-            let selected = self.selection.contains(&note_id(note));
+            let selected = self.selection.contains(&note_key(note));
             let fill = if selected {
                 GOLD
             } else if self.track == Track::Pads {
@@ -1034,7 +886,7 @@ impl PianoRoll {
             painter.rect_filled(
                 hit,
                 2.0,
-                fill.gamma_multiply(if note.expression.is_some() || assigned(&app.studio, note.input, duration) {
+                fill.gamma_multiply(if note.expression.is_some() || assigned(&app.project.studio, note.input) {
                     0.86
                 } else {
                     0.42
@@ -1062,7 +914,7 @@ impl PianoRoll {
                 }
                 Gesture::Move { start, .. } => {
                     for &(ref note, hit) in &notes {
-                        if self.selection.contains(&note_id(note)) {
+                        if self.selection.contains(&note_key(note)) {
                             let delta = pos - start;
                             painter.rect_stroke(
                                 hit.translate(vec2(
@@ -1077,7 +929,7 @@ impl PianoRoll {
                     }
                 }
                 Gesture::Resize { start, note } => {
-                    if let Some((_, hit)) = notes.iter().find(|(event, _)| note_id(event) == note)
+                    if let Some((_, hit)) = notes.iter().find(|(event, _)| note_key(event) == note)
                     {
                         painter.rect_stroke(
                             hit.with_max_x((hit.right() + pos.x - start.x).max(hit.left() + 5.0)),
@@ -1094,7 +946,7 @@ impl PianoRoll {
             && hovered.is_none()
             && response.hovered()
             && let Some(note) = pointer.and_then(|pos| self.draw_note(app, &view, pos))
-            && assigned(&app.studio, note.input, duration)
+            && assigned(&app.project.studio, note.input)
             && let Some(hit) = view.note_rect(&note)
         {
             painter.rect_stroke(
@@ -1118,41 +970,7 @@ impl PianoRoll {
         view
     }
 
-    fn move_notes(&mut self, studio: &mut Studio, duration: f64, ticks: i64, rows: i32, lanes: Option<&[ChopInput]>) {
-        let Some(&(first, _)) = self.selection.first() else {
-            return;
-        };
-        let &(last, _) = self.selection.last().unwrap();
-        let ticks = ticks.clamp(
-            -i64::from(first),
-            i64::from(studio.pattern_ticks() - 1) - i64::from(last),
-        );
-        let track = self.track;
-        let destination = |input| {
-            if rows == 0 { return Some(input); }
-            if let Some(lanes) = lanes {
-                let row = lanes.iter().position(|lane| *lane == input)? as i32 + rows;
-                return usize::try_from(row).ok().and_then(|row| lanes.get(row)).copied();
-            }
-            let row = Track::row(input) as i32 + rows;
-            (0..track.rows() as i32)
-                .contains(&row)
-                .then(|| track.input(row as usize))
-        };
-        if rows != 0
-            && studio.roll_notes().iter().filter(|note| self.selection.contains(&note_id(note))).any(|note| {
-                destination(note.input).is_none_or(|input| note.expression.is_none() && !assigned(studio, input, duration))
-            })
-        {
-            self.message = Some("Move notes to lanes with assigned chops.".into());
-            return;
-        }
-        studio.edit_roll_notes(|notes| self.apply(notes, |mut note| {
-            note.tick = (i64::from(note.tick) + ticks) as u32;
-            note.input = destination(note.input).unwrap_or(note.input);
-            Some(note)
-         }));
-    }
+
 }
 
 fn clipboard_notes(text: &str) -> Option<Vec<PlayedChop>> {
@@ -1236,12 +1054,13 @@ mod tests {
     fn box_selection_moves_and_quantizes_only_the_selected_notes() {
         let context = Context::default();
         let mut app = App::new(context.clone());
-        app.output = None;
-        app.clip = Some(Arc::new(Clip::new(8_000, vec![[0.0; 2]; 8_000])));
-        app.studio.pads[0] = Some(0.0);
-        app.studio.pads[1] = Some(0.3);
-        let untouched = pad(187, 2, 91);
-        app.studio.performance = vec![pad(120, 0, 70), untouched.clone(), pad(249, 1, 100)];
+        app.audio.remove_output();
+        app.media.replace(Some(Arc::new(Clip::new(8_000, vec![[0.0; 2]; 8_000]))));
+        app.project.studio.pads[0] = Some(0.0);
+        app.project.studio.pads[1] = Some(0.3);
+        app.project.studio.performance = vec![pad(120, 0, 70), pad(187, 2, 91), pad(249, 1, 100)];
+        app.observe_edits(false);
+        let initial = app.project.studio.performance.clone();
         let mut roll = PianoRoll::new(&app);
         let render = |roll: &mut PianoRoll, app: &mut App, events| {
             render_canvas(&context, roll, app, events)
@@ -1270,35 +1089,78 @@ mod tests {
             &mut app,
             vec![egui::Event::PointerMoved(start), press(start, true)],
         );
+        render(&mut roll, &mut app, vec![egui::Event::PointerMoved(end)]);
+        assert_eq!(app.project.studio.performance, initial);
         render(
             &mut roll,
             &mut app,
             vec![egui::Event::PointerMoved(end), press(end, false)],
         );
-        let moved = vec![pad(172, 0, 70), untouched, pad(301, 1, 100)];
-        assert_eq!(app.studio.performance, moved);
-        app.observe_edits(false);
-        let moved = app.studio.performance.clone();
-        roll.quantize(&mut app.studio);
-        assert_eq!(app.studio.performance.iter().map(|note| note.tick).collect::<Vec<_>>(), [120, 187, 360]);
-        assert_eq!(app.studio.performance.iter().map(|note| note.id).collect::<Vec<_>>(),
+        let mut moved = initial.clone();
+        moved[0].tick = 172;
+        moved[2].tick = 301;
+        assert_eq!(app.project.studio.performance, moved);
+        roll.edit(&mut app, Edit::Quantize { grid: roll.grid, strength: roll.strength }, false);
+        assert_eq!(app.project.studio.performance.iter().map(|note| note.tick).collect::<Vec<_>>(), [120, 187, 360]);
+        assert_eq!(app.project.studio.performance.iter().map(|note| note.id).collect::<Vec<_>>(),
             moved.iter().map(|note| note.id).collect::<Vec<_>>());
-        app.observe_edits(false);
         app.undo_project(false);
-        assert_eq!(app.studio.performance, moved);
+        assert_eq!(app.project.studio.performance, moved);
+        app.undo_project(false);
+        assert_eq!(app.project.studio.performance, initial);
+    }
+
+    #[test]
+    fn resizing_a_gate_note_commits_on_release_in_one_undo_step() {
+        let context = Context::default();
+        let mut app = App::new(context.clone());
+        app.audio.remove_output();
+        app.library.midi.piano_view = false;
+        app.media.replace(Some(Arc::new(Clip::new(8_000, vec![[0.0; 2]; 8_000]))));
+        app.project.studio.pads[0] = Some(0.0);
+        app.project.studio.performance = vec![PlayedChop {
+            mode: PadMode::Gate,
+            length: Some(240),
+            ..pad(120, 0, 100)
+        }];
+        app.observe_edits(false);
+        let mut roll = PianoRoll::new(&app);
+        render_canvas(&context, &mut roll, &mut app, vec![]);
+        let start = pos2(200.0, 9.0);
+        let end = start + vec2(46.0, 0.0);
+        render_canvas(
+            &context,
+            &mut roll,
+            &mut app,
+            vec![egui::Event::PointerMoved(start), press(start, true)],
+        );
+        render_canvas(
+            &context,
+            &mut roll,
+            &mut app,
+            vec![egui::Event::PointerMoved(end)],
+        );
+        assert_eq!(app.project.studio.performance[0].length, Some(240));
+        render_canvas(&context, &mut roll, &mut app, vec![press(end, false)]);
+        let resized = &app.project.studio.active_sequence().performance[0];
+        assert_eq!((resized.tick, resized.length), (120, Some(360)));
+        app.undo_project(false);
+        assert_eq!(app.project.studio.performance[0].length, Some(240));
+        app.undo_project(true);
+        assert_eq!(app.project.studio.performance[0].length, Some(360));
     }
 
     #[test]
     fn draws_on_an_empty_roll_and_pastes_to_another_bar_without_replacing_hits() {
         let context = Context::default();
         let mut app = App::new(context.clone());
-        app.output = None;
+        app.audio.remove_output();
         app.library.midi.piano_view = false;
-        app.clip = Some(Arc::new(Clip::new(8_000, vec![[0.0; 2]; 8_000])));
-        app.studio.bars = 2;
-        app.studio.swing = 1.0;
-        app.studio.pads[0] = Some(0.0);
-        app.studio.pads[1] = Some(0.3);
+        app.media.replace(Some(Arc::new(Clip::new(8_000, vec![[0.0; 2]; 8_000]))));
+        app.project.studio.bars = 2;
+        app.project.studio.swing = 1.0;
+        app.project.studio.pads[0] = Some(0.0);
+        app.project.studio.pads[1] = Some(0.3);
         let mut roll = PianoRoll::new(&app);
         assert!(roll.draw);
         render_canvas(&context, &mut roll, &mut app, vec![]);
@@ -1313,9 +1175,9 @@ mod tests {
         };
         click(&mut roll, &mut app, pos2(139.0, 9.0));
         assert_eq!(
-            app.studio.performance[0],
+            app.project.studio.performance[0],
             PlayedChop {
-                id: Default::default(),
+                id: app.project.studio.performance[0].id,
                 tick: 180,
                 input: ChopInput::Pad(0),
                 mode: PadMode::Slice,
@@ -1325,13 +1187,14 @@ mod tests {
             expression: None,
             }
         );
+        assert!(!app.project.studio.performance[0].id.is_empty());
         roll.snap_draw = false;
         roll.draw_gate = true;
         roll.velocity = 89;
         roll.hold_ticks = 55;
         click(&mut roll, &mut app, pos2(161.0, 28.0));
         let raw = PlayedChop {
-            id: Default::default(),
+            id: app.project.studio.performance[1].id,
             tick: 253,
             input: ChopInput::Pad(1),
             mode: PadMode::Gate,
@@ -1340,10 +1203,10 @@ mod tests {
             sound: Default::default(),
             expression: None,
         };
-        assert_eq!(app.studio.performance[1], raw);
+        assert_eq!(app.project.studio.performance[1], raw);
         click(&mut roll, &mut app, pos2(180.0, 47.0));
-        assert_eq!(app.studio.performance.len(), 2);
-        roll.select_all(&app.studio);
+        assert_eq!(app.project.studio.performance.len(), 2);
+        roll.select_all(&app.project.studio);
         let copied = render_canvas(&context, &mut roll, &mut app, vec![egui::Event::Copy]);
         let text = copied
             .platform_output
@@ -1355,9 +1218,9 @@ mod tests {
             })
             .unwrap();
         let occupied = pad(TICKS_PER_BAR + 180, 0, 44);
-        app.studio.performance.push(occupied);
+        app.project.studio.performance.push(occupied);
         app.observe_edits(false);
-        let before_paste = app.studio.performance.clone();
+        let before_paste = app.project.studio.performance.clone();
         let occupied = before_paste[2].clone();
         roll.bar = 1;
         app.piano_roll_clipboard.clear();
@@ -1368,22 +1231,22 @@ mod tests {
             vec![egui::Event::Paste(text)],
         );
         let pasted = PlayedChop {
+            id: app.project.studio.performance[3].id,
             tick: TICKS_PER_BAR + raw.tick,
             ..raw
         };
-        assert_eq!(&app.studio.performance[2..], &[occupied, pasted.clone()]);
-        assert_eq!(roll.selection, BTreeSet::from([note_id(&pasted)]));
-        app.observe_edits(false);
-        assert_ne!(app.studio.performance[3].id, before_paste[1].id);
-        assert!(!app.studio.performance[3].id.is_empty());
+        assert_eq!(&app.project.studio.performance[2..], &[occupied, pasted.clone()]);
+        assert_eq!(roll.selection, BTreeSet::from([note_key(&pasted)]));
+        assert_ne!(app.project.studio.performance[3].id, before_paste[1].id);
+        assert!(!app.project.studio.performance[3].id.is_empty());
         app.undo_project(false);
-        assert_eq!(app.studio.performance, before_paste);
+        assert_eq!(app.project.studio.performance, before_paste);
 
-        roll.select_all(&app.studio);
+        roll.select_all(&app.project.studio);
         roll.copy_selected(&mut app, &context);
         roll.bar = 1;
         roll.paste(&mut app);
-        assert_eq!(app.studio.performance, before_paste);
+        assert_eq!(app.project.studio.performance, before_paste);
         assert_eq!(
             roll.message.as_deref(),
             Some("Add more bars before pasting this selection.")
@@ -1392,7 +1255,9 @@ mod tests {
 
     #[test]
     fn selected_quantize_preserves_collisions_and_uses_swing() {
-        let mut studio = Studio {
+        let mut app = App::new(Context::default());
+        app.audio.remove_output();
+        app.project.studio = Studio {
             swing: 1.0,
             performance: vec![pad(152, 0, 70), pad(173, 1, 94), pad(180, 0, 108)],
             ..Studio::default()
@@ -1419,10 +1284,10 @@ mod tests {
             message: None,
             transcription_sound: Default::default(),
         };
-        roll.quantize(&mut studio);
+        roll.edit(&mut app, Edit::Quantize { grid: roll.grid, strength: roll.strength }, false);
         assert_eq!(
-            studio.performance,
-            vec![pad(152, 0, 70), pad(180, 0, 108), pad(180, 1, 94)]
+            app.project.studio.performance.iter().map(|note| (note.tick, note.input, note.velocity)).collect::<Vec<_>>(),
+            [(152, ChopInput::Pad(0), 70), (180, ChopInput::Pad(0), 108), (180, ChopInput::Pad(1), 94)]
         );
         assert_eq!(
             roll.selection,

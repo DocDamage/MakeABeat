@@ -464,11 +464,11 @@ mod tests {
         );
         files::save_project(
             &path,
-            &files::Project {
+            &crate::model::project::Project {
                 record: None,
                 studio: studio.clone(),
                 samples: Vec::new(),
-                ..files::Project::default()
+                ..crate::model::project::Project::default()
             },
             Some(&clip),
         )?;

@@ -192,9 +192,9 @@ mod tests {
             ..Studio::default()
         };
         studio.performance.push(note(0, 480, 69, 1200));
-        let project = files::Project {
+        let project = crate::model::project::Project {
             studio,
-            ..files::Project::default()
+            ..crate::model::project::Project::default()
         };
         files::save_project(&path, &project, None)?;
         assert_eq!(&std::fs::read(&path)?[..8], b"LSFLIP08");

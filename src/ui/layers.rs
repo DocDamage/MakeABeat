@@ -52,7 +52,7 @@ pub(super) fn edit(ui: &mut Ui, app: &App, layers: &mut Layers) {
         small(ui, "Overlapping velocity ranges play together.");
         velocity(ui, "Base layer", &mut layers.base);
         let selected = app.selection().or_else(|| {
-            let duration = app.source_duration(app.active_source);
+            let duration = app.source_duration(app.media.active_source());
             (duration > 0.0).then_some((0.0, duration))
         });
         for (index, slot) in layers.extra.iter_mut().enumerate() {
@@ -63,7 +63,7 @@ pub(super) fn edit(ui: &mut Ui, app: &App, layers: &mut Layers) {
                         && let Some((start, end)) = selected
                     {
                         *slot = Some(Layer {
-                            source: app.active_source,
+                            source: app.media.active_source(),
                             start,
                             end,
                             controls: SampleControls::default(),
@@ -82,7 +82,7 @@ pub(super) fn edit(ui: &mut Ui, app: &App, layers: &mut Layers) {
                         ComboBox::from_id_salt("layer_source")
                             .selected_text(name)
                             .show_ui(ui, |ui| {
-                                for source in 0..=app.studio.sources.len() {
+                                for source in 0..=app.project.studio.sources.len() {
                                     if app.source_duration(source) > 0.0 {
                                         let title = app
                                             .source_record(source)
@@ -98,7 +98,7 @@ pub(super) fn edit(ui: &mut Ui, app: &App, layers: &mut Layers) {
                         if action(ui, "Use selection", app.selection().is_some()).clicked()
                             && let Some((start, end)) = app.selection()
                         {
-                            layer.source = app.active_source;
+                            layer.source = app.media.active_source();
                             layer.start = start;
                             layer.end = end;
                         }

@@ -103,7 +103,7 @@ pub(super) fn show(app: &mut App, ui: &mut Ui) {
 }
 
 fn inspector_header(app: &mut App, ui: &mut Ui, fallback: Option<Tool>) -> Option<Tool> {
-    let mut selected = app.sample_tool.or(fallback);
+    let mut selected = app.view.sample_tool.or(fallback);
     ui.horizontal_wrapped(|ui| {
         if pill(ui, Tool::Pads.title(), selected == Some(Tool::Pads)).clicked() {
             selected = Some(Tool::Pads);
@@ -130,11 +130,11 @@ fn inspector_header(app: &mut App, ui: &mut Ui, fallback: Option<Tool>) -> Optio
             selected = None;
         }
     });
-    if selected != app.sample_tool.or(fallback) {
+    if selected != app.view.sample_tool.or(fallback) {
         if let Some(tool) = selected {
             Action::Sample(tool).run(app);
         } else {
-            app.sample_tool = None;
+            app.view.sample_tool = None;
         }
     }
     selected
@@ -156,7 +156,7 @@ fn inspector_body(app: &mut App, ui: &mut Ui, tool: Tool) {
                 end - start
             ),
         );
-    } else if let Some(record) = app.source_record(app.active_source) {
+    } else if let Some(record) = app.source_record(app.media.active_source()) {
         small(ui, format!("Source · {}", record.title));
     }
     match tool {
@@ -199,14 +199,14 @@ fn transcription(app: &mut App, ui: &mut Ui) {
 fn source_picker(app: &mut App, ui: &mut Ui) {
     ui.horizontal_wrapped(|ui| {
         let selected = app
-            .source_record(app.active_source)
+            .source_record(app.media.active_source())
             .map_or("No audio loaded", |record| record.title.as_str());
-        let mut source = app.active_source;
+        let mut source = app.media.active_source();
         ComboBox::from_id_salt("project_source")
             .selected_text(selected)
             .width(ui.available_width().min(250.0))
             .show_ui(ui, |ui| {
-                for index in 0..=app.studio.sources.len() {
+                for index in 0..=app.project.studio.sources.len() {
                     if let Some(record) = app.source_record(index) {
                         ui.selectable_value(&mut source, index, &record.title);
                     }
@@ -238,7 +238,7 @@ fn record_input(app: &mut App, ui: &mut Ui) {
         });
         if ui
             .add_enabled(
-                app.output.is_some(),
+                app.audio.output().is_some(),
                 egui::Checkbox::new(&mut app.input_monitor, "Monitor input"),
             )
             .on_hover_text("Use headphones when monitoring a microphone.")
@@ -282,7 +282,7 @@ fn stem_separation(app: &mut App, ui: &mut Ui) {
                 .pick_file()
                 .or(app.demucs_path.take());
         }
-        let space = app.studio.sources.len() + 1 + crate::separation::STEMS.len()
+        let space = app.project.studio.sources.len() + 1 + crate::separation::STEMS.len()
             <= crate::model::MAX_SOURCES;
         if action(
             ui,
@@ -332,8 +332,8 @@ fn suggestions(app: &mut App, ui: &mut Ui) {
                 format!("{} – {}", time(range.0, true), time(range.1, true)),
             );
             select = action(ui, "Select range", true).clicked();
-            play = action(ui, "Audition", app.output.is_some() && !app.playing).clicked();
-            save = action(ui, "Save cut", app.samples.len() < MAX_NAMED_SAMPLES).clicked();
+            play = action(ui, "Audition", app.audio.output().is_some() && !app.playing).clicked();
+            save = action(ui, "Save cut", app.project.samples.len() < MAX_NAMED_SAMPLES).clicked();
         });
         if select || save {
             app.select_suggestion(index, save);
@@ -349,11 +349,11 @@ fn warp_editor(app: &mut App, ui: &mut Ui) {
         ui,
         "Select a range. Mark source positions and set the beat each position should land on, measured from the start of the new clip.",
     );
-    let source = app.active_source;
+    let source = app.media.active_source();
     let duration = app.duration();
     let selection = app.selection();
     let mut markers = app
-        .studio
+        .project.studio
         .warp_markers
         .get(&source)
         .cloned()
@@ -368,7 +368,7 @@ fn warp_editor(app: &mut App, ui: &mut Ui) {
         .clicked()
     {
         let start = selection.unwrap().0;
-        let beat = ((app.position - start) * f64::from(app.studio.bpm) / 60.0 * 4.0).round() / 4.0;
+        let beat = ((app.position - start) * f64::from(app.project.studio.bpm) / 60.0 * 4.0).round() / 4.0;
         markers.push(crate::stretch::Marker {
             source_seconds: app.position,
             target_beat: beat.max(0.25),
@@ -406,9 +406,9 @@ fn warp_editor(app: &mut App, ui: &mut Ui) {
     }
     if before != markers {
         if markers.is_empty() {
-            app.studio.warp_markers.remove(&source);
+            app.project.studio.warp_markers.remove(&source);
         } else {
-            app.studio.warp_markers.insert(source, markers);
+            app.project.studio.warp_markers.insert(source, markers);
         }
     }
     ui.add_enabled_ui(selection.is_some() && app.can_add_source(), |ui| {
@@ -461,7 +461,7 @@ pub(super) fn slice_controls(app: &mut App, ui: &mut Ui) -> bool {
         ui.selectable_value(&mut mode, 2, "Transients");
         ui.selectable_value(&mut mode, 3, "Warp markers");
     });
-    let beat = 60.0 / f64::from(app.studio.bpm);
+    let beat = 60.0 / f64::from(app.project.studio.bpm);
     if mode == 1 {
         ui.add(
             DragValue::new(&mut division)
@@ -487,7 +487,7 @@ pub(super) fn slice_controls(app: &mut App, ui: &mut Ui) -> bool {
     });
     let mut boundaries = vec![start];
     if mode == 1 || mode == 4 {
-        if let Some(map) = app.studio.beat_maps.get(&app.active_source) {
+        if let Some(map) = app.project.studio.beat_maps.get(&app.media.active_source()) {
             boundaries.extend(map.slice_points((start, end), mode == 4, division));
             if boundaries.len() == 1 {
                 small(ui, "Select a range containing beat or bar markers.");
@@ -505,7 +505,7 @@ pub(super) fn slice_controls(app: &mut App, ui: &mut Ui) -> bool {
             small(ui, "Add bar starts in Beat map first.");
         }
     } else if mode == 3 {
-        if let Some(markers) = app.studio.warp_markers.get(&app.active_source) {
+        if let Some(markers) = app.project.studio.warp_markers.get(&app.media.active_source()) {
             boundaries.extend(
                 markers
                     .iter()
@@ -535,7 +535,7 @@ pub(super) fn slice_controls(app: &mut App, ui: &mut Ui) -> bool {
             boundaries.push(adjusted);
         }
     }
-    if (mode == 4 || (mode == 1 && app.studio.beat_maps.contains_key(&app.active_source)))
+    if (mode == 4 || (mode == 1 && app.project.studio.beat_maps.contains_key(&app.media.active_source())))
         && boundaries.len() < 2
     {
         return false;
@@ -557,7 +557,7 @@ pub(super) fn slice_controls(app: &mut App, ui: &mut Ui) -> bool {
             if action(
                 ui,
                 &format!("Play {}", index + 1),
-                app.output.is_some() && !app.playing,
+                app.audio.output().is_some() && !app.playing,
             )
             .on_hover_text(format!("{:.3}–{:.3} s", pair[0], pair[1]))
             .clicked()
@@ -567,7 +567,7 @@ pub(super) fn slice_controls(app: &mut App, ui: &mut Ui) -> bool {
         }
     });
     if primary(ui, "Apply slices", true).clicked() {
-        app.studio.apply_slices(&boundaries, app.active_source);
+        app.project.studio.apply_slices(&boundaries, app.media.active_source());
         return true;
     }
     false
@@ -580,7 +580,7 @@ fn fit_to_bars(app: &mut App, ui: &mut Ui) {
             ui.menu_button("Fit to bars…", |ui| {
                 small(ui, "Prepares a pitch-preserved preview at the current BPM.");
                 for bars in [1, 2, 4, 8] {
-                    let seconds = 240.0 * bars as f64 / f64::from(app.studio.bpm);
+                    let seconds = 240.0 * bars as f64 / f64::from(app.project.studio.bpm);
                     let enabled = app.selection().is_some_and(|(start, end)| {
                         (0.5..=2.0).contains(&(seconds / (end - start)))
                     });
@@ -634,12 +634,11 @@ mod tests {
     fn sample_keeps_the_waveform_visible_with_pads_or_a_contextual_tool() {
         let ctx = Context::default();
         let mut app = App::new(ctx.clone());
-        app.output = None;
-        app.audio_error = None;
+        app.audio = Default::default();
         app.library.interface = Default::default();
-        app.library.interface.apply(&ctx);
-        app.record = Some(files::local_record(PathBuf::from("fixture.wav")));
-        app.clip = Some(Arc::new(Clip::new(8_000, vec![[0.25; 2]; 32_000])));
+        crate::ui::preferences::apply(app.library.interface, &ctx);
+        app.project.record = Some(files::local_record(PathBuf::from("fixture.wav")));
+        app.media.replace(Some(Arc::new(Clip::new(8_000, vec![[0.25; 2]; 32_000]))));
         app.set_loop_range((1.0, 2.0));
         Action::Studio(crate::app::StudioView::Sample).run(&mut app);
 

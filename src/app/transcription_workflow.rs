@@ -84,7 +84,7 @@ impl Editor {
 
 impl App {
     pub fn open_transcription(&mut self) {
-        let source = self.active_source;
+        let source = self.media.active_source();
         let Some(clip) = self.source_arc(source) else {
             return;
         };
@@ -100,7 +100,7 @@ impl App {
             .source_record(source)
             .map_or("Source audio", |record| record.title.as_str())
             .to_owned();
-        let map = self.studio.beat_maps.get(&source).cloned();
+        let map = self.project.studio.beat_maps.get(&source).cloned();
         let sound = self
             .transcription_sounds()
             .into_iter()
@@ -113,7 +113,7 @@ impl App {
             title,
             range,
             map,
-            bpm: self.studio.bpm,
+            bpm: self.project.studio.bpm,
             alignment: Alignment::Selection,
             detection: Detection::default(),
             raw: None,
@@ -124,7 +124,7 @@ impl App {
                 .map(|i| format!("Transcription {i}"))
                 .find(|name| {
                     !self
-                        .studio
+                        .project.studio
                         .patterns
                         .iter()
                         .any(|pattern| pattern.name.eq_ignore_ascii_case(name))
@@ -229,7 +229,7 @@ impl App {
     }
 
     pub fn listen_transcription_source(&mut self, editor: &mut Editor) {
-        if self.output.is_none() || self.recording {
+        if self.audio.output().is_none() || self.recording {
             return;
         }
         self.stop_all();
@@ -260,7 +260,7 @@ impl App {
                 choices.push((name, instrument));
             }
         };
-        if let Some(sample) = self.studio.chromatic {
+        if let Some(sample) = self.project.studio.chromatic {
             add(
                 "Studio chromatic sample".into(),
                 sample.source,
@@ -269,9 +269,9 @@ impl App {
             );
         }
         if let Some(range) = self.selection() {
-            add("Current selection".into(), self.active_source, range, 60);
+            add("Current selection".into(), self.media.active_source(), range, 60);
         }
-        for cut in &self.samples {
+        for cut in &self.project.samples {
             add(cut.name.clone(), cut.source, cut.range(), 60);
         }
         choices
@@ -279,7 +279,7 @@ impl App {
 
     pub fn set_transcription_sound(&mut self, sound: Instrument) {
         let groups: HashSet<_> = self
-            .studio
+            .project.studio
             .performance
             .iter()
             .filter_map(|note| {
@@ -289,7 +289,7 @@ impl App {
             })
             .collect();
         self.observe_edits(false);
-        for note in &mut self.studio.performance {
+        for note in &mut self.project.studio.performance {
             if let Some(expression) = &mut note.expression
                 && expression.instrument != sound
             {
@@ -297,7 +297,7 @@ impl App {
             }
         }
         for note in self
-            .studio
+            .project.studio
             .patterns
             .iter_mut()
             .flat_map(|pattern| &mut pattern.notes.performance)
@@ -346,7 +346,7 @@ impl App {
         let parts = transcription::split(phrase, || self.random().max(1));
         let linked = parts.len() > 1;
         self.observe_edits(false);
-        let mut project = self.project_snapshot();
+        let mut project = self.project.clone();
         let studio = &mut project.studio;
         if linked
             && (studio.sections.len() + parts.len() > MAX_SECTIONS
@@ -383,11 +383,11 @@ impl App {
             return Err("The phrase would exceed the project metadata limit.".into());
         }
         self.stop_all();
-        self.studio = project.studio;
+        self.project.studio = project.studio;
         self.reset_pattern_editor();
-        self.studio_view = StudioView::Sequence;
+        self.view.studio_view = StudioView::Sequence;
         self.observe_edits(false);
-        self.piano_roll = Some(crate::ui::piano_roll::PianoRoll::keys(self));
+        self.view.piano_roll = Some(crate::ui::piano_roll::PianoRoll::keys(self));
         self.status = Some((
             if linked {
                 "Imported linked transcription patterns.".into()
@@ -410,10 +410,10 @@ mod tests {
     {
         let mut app = App::new(eframe::egui::Context::default());
         let clip = Arc::new(Clip::new(1_000, vec![[0.2; 2]; 34_000]));
-        app.clip = Some(clip.clone());
-        app.studio.bpm = 120;
+        app.media.replace(Some(clip.clone()));
+        app.project.studio.bpm = 120;
         app.observe_edits(false);
-        app.session.reset(app.project_snapshot(), None, None);
+        app.session.reset(app.project.clone(), None, None);
         let before = app.session.current.clone();
         app.open_transcription();
         let mut editor = app.transcription.editor.take().unwrap();
@@ -435,8 +435,8 @@ mod tests {
         ]);
         editor.align();
         app.commit_transcription(&mut editor)?;
-        assert_eq!(app.studio.sections.len(), 2);
-        let song = app.studio.song_sequence().unwrap();
+        assert_eq!(app.project.studio.sections.len(), 2);
+        let song = app.project.studio.song_sequence().unwrap();
         assert_eq!(song.ticks(), 17 * TICKS_PER_BAR);
         assert_eq!(song.performance.len(), 2);
         let timing = |notes: &[PlayedChop]| {
@@ -447,7 +447,7 @@ mod tests {
         };
         let sound = transcription::sample_instrument(0, &clip, (0.0, 0.8), 48).unwrap();
         app.set_transcription_sound(sound);
-        let updated = app.studio.song_sequence().unwrap();
+        let updated = app.project.studio.song_sequence().unwrap();
         assert_eq!(timing(&updated.performance), timing(&song.performance));
         assert!(
             updated
@@ -456,7 +456,7 @@ mod tests {
                 .all(|note| note.expression.as_ref().unwrap().instrument == sound)
         );
         app.undo_project(false);
-        assert_eq!(app.studio.song_sequence(), Some(song));
+        assert_eq!(app.project.studio.song_sequence(), Some(song));
         app.undo_project(false);
         assert!(app.session.current == before);
         assert!(!app.can_undo_project(false));

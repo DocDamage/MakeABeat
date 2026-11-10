@@ -33,7 +33,7 @@ impl Default for Dialog {
 impl Dialog {
     pub fn show(&mut self, app: &mut App, ctx: &Context) -> bool {
         let mut close = false;
-        self.selected = self.selected.min(app.snapshots.len().saturating_sub(1));
+        self.selected = self.selected.min(app.project.snapshots.len().saturating_sub(1));
         let modal = responsive_modal(ctx, "project_snapshots", 580.0, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.heading("Project snapshots");
@@ -43,7 +43,7 @@ impl Dialog {
                 ui,
                 format!(
                     "{} of {MAX_SNAPSHOTS} snapshots · {} MiB metadata limit · Shared audio",
-                    app.snapshots.len(),
+                    app.project.snapshots.len(),
                     MAX_SNAPSHOT_BYTES / (1024 * 1024)
                 ),
             );
@@ -52,25 +52,25 @@ impl Dialog {
                 ui.text_edit_singleline(&mut self.name);
                 let ready = !app.recording
                     && !self.name.trim().is_empty()
-                    && app.snapshots.len() < MAX_SNAPSHOTS;
+                    && app.project.snapshots.len() < MAX_SNAPSHOTS;
                 if action(ui, "Save snapshot", ready).clicked() {
                     match app.save_named_snapshot(&self.name) {
                         Ok(()) => {
                             self.name.clear();
                             self.error = None;
-                            self.selected = app.snapshots.len() - 1;
+                            self.selected = app.project.snapshots.len() - 1;
                         }
                         Err(error) => self.error = Some(error.to_string()),
                     }
                 }
             });
-            if !app.snapshots.is_empty() {
+            if !app.project.snapshots.is_empty() {
                 let settings = (self.selected, self.song, self.bar, self.match_level);
                 ui.horizontal_wrapped(|ui| {
                     ComboBox::from_id_salt("snapshot_selection")
-                        .selected_text(&app.snapshots[self.selected].name)
+                        .selected_text(&app.project.snapshots[self.selected].name)
                         .show_ui(ui, |ui| {
-                            for (index, snapshot) in app.snapshots.iter().enumerate() {
+                            for (index, snapshot) in app.project.snapshots.iter().enumerate() {
                                 ui.selectable_value(&mut self.selected, index, &snapshot.name);
                             }
                         });
@@ -85,10 +85,10 @@ impl Dialog {
                         .clicked()
                     {
                         app.delete_named_snapshot(self.selected);
-                        self.selected = self.selected.min(app.snapshots.len().saturating_sub(1));
+                        self.selected = self.selected.min(app.project.snapshots.len().saturating_sub(1));
                     }
                 });
-                if !app.snapshots.is_empty() {
+                if !app.project.snapshots.is_empty() {
                     ui.horizontal_wrapped(|ui| {
                         ui.selectable_value(&mut self.song, false, "Pattern");
                         ui.selectable_value(&mut self.song, true, "Song");
@@ -107,7 +107,7 @@ impl Dialog {
                         "Both previews restart from the chosen bar and play up to four bars at their saved tempos.",
                     );
                     ui.horizontal_wrapped(|ui| {
-                        let ready = app.output.is_some() && app.busy.is_none() && !app.recording;
+                        let ready = app.audio.output().is_some() && app.busy.is_none() && !app.recording;
                         if action(ui, "Prepare comparison", ready).clicked() {
                             self.error = app
                                 .prepare_snapshot_preview(
@@ -120,7 +120,7 @@ impl Dialog {
                                 .map(|error| error.to_string());
                         }
                         let prepared =
-                            app.snapshot_preview_ready() && app.output.is_some() && !app.recording;
+                            app.snapshot_preview_ready() && app.audio.output().is_some() && !app.recording;
                         if action(ui, "A · Working", prepared).clicked() {
                             app.play_snapshot_preview(0);
                         }

@@ -1,6 +1,9 @@
 use super::super::{DIM, EDGE, GOLD, INSET, MINT, TEXT};
 use super::automation::{AutomationClipboard, Editor, LaneView};
-use crate::model::{MAX_SECTIONS, MAX_SONG_BARS, STEPS, SectionKind, SectionSpan, Studio};
+use crate::{
+    app::arrangement_workflow::{Edge, Edit, trimmed_span},
+    model::{STEPS, Section, SectionKind, SectionSpan, Studio},
+};
 use eframe::egui::{
     self, Align2, Color32, CursorIcon, FontId, Rect, ScrollArea, Sense, Stroke, StrokeKind, Ui,
     pos2, vec2,
@@ -9,11 +12,10 @@ use eframe::egui::{
 const RULER: f32 = 22.0;
 const TRACK: f32 = 56.0;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 enum DragMode {
     Move,
-    Start,
-    End,
+    Trim(Edge),
 }
 
 #[derive(Clone, Copy)]
@@ -58,42 +60,41 @@ impl Timeline {
         }
     }
 
-    pub fn can_duplicate(&self, studio: &Studio) -> bool {
-        studio.sections.len() < MAX_SECTIONS
-            && self
-                .selected
-                .and_then(|index| studio.sections.get(index))
-                .is_some_and(|section| {
-                    studio.song_bars() + section.bars(studio.patterns[section.pattern].length)
-                        <= MAX_SONG_BARS
-                })
-    }
-
-    pub fn duplicate(&mut self, studio: &mut Studio) {
-        if self.can_duplicate(studio)
-            && let Some(index) = self.selected
-        {
-            studio
-                .sections
-                .insert(index + 1, studio.sections[index].clone());
-            self.sections_changed();
-            self.select(index + 1);
-        }
-    }
-
-    pub fn move_section(&mut self, studio: &mut Studio, from: usize, to: usize) {
-        if from != to {
-            let section = studio.sections.remove(from);
-            studio.sections.insert(to, section);
-            self.sections_changed();
-        }
-        self.selected = Some(to);
-    }
-
     pub fn sections_changed(&mut self) {
+        self.drag = None;
         if let Some(editor) = &mut self.automation {
             editor.sections_changed();
         }
+    }
+
+    pub fn restore_sections(&mut self, previous: &[Section], restored: &[Section]) {
+        self.sections_changed();
+        let selected = self
+            .selected
+            .or_else(|| (previous.is_empty() && !restored.is_empty()).then_some(0));
+        self.selected = selected.and_then(|index| {
+            let last = restored.len().checked_sub(1)?;
+            // A trim changes only this slot, even if another section matches its old span.
+            if previous.len() == restored.len()
+                && previous
+                    .iter()
+                    .zip(restored)
+                    .enumerate()
+                    .all(|(slot, (before, after))| slot == index || before == after)
+            {
+                return Some(index.min(last));
+            }
+            let matching = previous.get(index).and_then(|selected| {
+                restored
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, section)| *section == selected)
+                    .min_by_key(|(candidate, _)| index.abs_diff(*candidate))
+                    .map(|(candidate, _)| candidate)
+            });
+            Some(matching.unwrap_or(index.min(last)))
+        });
+        self.reveal = self.selected.is_some() && previous != restored;
     }
 
     pub fn show(
@@ -102,8 +103,12 @@ impl Timeline {
         studio: &mut Studio,
         playhead: Option<usize>,
         editable: bool,
-    ) {
-        if !editable {
+    ) -> Option<Edit> {
+        if !editable
+            || self
+                .drag
+                .is_some_and(|drag| drag.index >= studio.sections.len())
+        {
             self.cancel_drag();
         }
         let width = ui.available_width();
@@ -113,7 +118,7 @@ impl Timeline {
             .auto_shrink([false, true])
             .drag_to_scroll(false)
             .show(ui, |ui| {
-                let width = self.canvas(ui, studio, playhead, editable, width);
+                let (width, edit) = self.canvas(ui, studio, playhead, editable, width);
                 if let Some(editor) = &mut self.automation {
                     editor.lane(
                         ui,
@@ -127,29 +132,37 @@ impl Timeline {
                         },
                     );
                 }
-            });
+                edit
+            })
+            .inner
     }
 
     fn canvas(
         &mut self,
         ui: &mut Ui,
-        studio: &mut Studio,
+        studio: &Studio,
         playhead: Option<usize>,
         editable: bool,
         width: f32,
-    ) -> f32 {
+    ) -> (f32, Option<Edit>) {
         let pointer = ui.input(|input| input.pointer.interact_pos());
         let mut bars = studio.song_bars();
-        if let Some(drag) = self.drag.filter(|drag| drag.mode != DragMode::Move)
+        if let Some(Drag {
+            index,
+            pointer: origin,
+            mode: DragMode::Trim(edge),
+        }) = self.drag
             && let Some(pointer) = pointer
+            && let Some(span) = trimmed_span(
+                studio,
+                index,
+                edge,
+                ((pointer.x - ui.cursor().left() - origin) / self.bar_width).round() as i32,
+            )
         {
-            let delta = pointer.x - ui.cursor().left() - drag.pointer;
-            let section = &studio.sections[drag.index];
+            let section = &studio.sections[index];
             let length = studio.patterns[section.pattern].length;
-            let resized = self
-                .resize(studio, drag, delta)
-                .map_or(section.bars(length), |span| span.bars);
-            bars = bars.max(bars - section.bars(length) + resized);
+            bars = bars.max(bars - section.bars(length) + span.bars);
         }
         let (rect, response) = ui.allocate_exact_size(
             vec2(
@@ -168,7 +181,7 @@ impl Timeline {
         {
             let cursor = match drag_mode(blocks[index], pos.x) {
                 DragMode::Move => CursorIcon::Grab,
-                DragMode::Start | DragMode::End => CursorIcon::ResizeHorizontal,
+                DragMode::Trim(_) => CursorIcon::ResizeHorizontal,
             };
             ui.ctx().set_cursor_icon(cursor);
         }
@@ -188,38 +201,47 @@ impl Timeline {
 
         let mut marker = None;
         let mut resized = None;
+        let mut edit = None;
         if let (Some(drag), Some(pos)) = (self.drag, pointer) {
             let delta = pos.x - rect.left() - drag.pointer;
             let released = ui.input(|input| !input.pointer.primary_down());
             if delta.abs() >= 3.0 {
-                if drag.mode == DragMode::Move {
-                    let from = drag.index;
-                    let center = blocks[from].center().x + delta;
-                    let to = blocks
-                        .iter()
-                        .enumerate()
-                        .filter(|(index, block)| *index != from && center > block.center().x)
-                        .count();
-                    if released {
-                        self.move_section(studio, from, to);
-                        blocks = section_rects(studio, lane, self.bar_width, None);
-                    } else {
-                        ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
-                        marker = Some(if to > from {
-                            blocks[to].right()
+                match drag.mode {
+                    DragMode::Move => {
+                        let from = drag.index;
+                        let center = blocks[from].center().x + delta;
+                        let to = blocks
+                            .iter()
+                            .enumerate()
+                            .filter(|(index, block)| *index != from && center > block.center().x)
+                            .count();
+                        if released {
+                            if from != to {
+                                edit = Some(Edit::Move { from, to });
+                            }
                         } else {
-                            blocks[to].left()
-                        });
+                            ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                            marker = Some(if to > from {
+                                blocks[to].right()
+                            } else {
+                                blocks[to].left()
+                            });
+                        }
                     }
-                } else {
-                    let span = self.resize(studio, drag, delta);
-                    if released {
-                        studio.sections[drag.index].span = span;
-                    } else {
-                        ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
-                        resized = span.map(|span| (drag.index, span));
+                    DragMode::Trim(edge) => {
+                        let index = drag.index;
+                        let delta = (delta / self.bar_width).round() as i32;
+                        if let Some(span) = trimmed_span(studio, index, edge, delta) {
+                            resized = Some((index, span));
+                            blocks = section_rects(studio, lane, self.bar_width, resized);
+                            if released {
+                                edit = Some(Edit::Trim { index, edge, delta });
+                            }
+                        }
+                        if !released {
+                            ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+                        }
                     }
-                    blocks = section_rects(studio, lane, self.bar_width, resized);
                 }
                 if !released {
                     let visible = ui.clip_rect();
@@ -343,35 +365,7 @@ impl Timeline {
                 }
             ));
         }
-        rect.width()
-    }
-
-    fn resize(&self, studio: &Studio, drag: Drag, delta: f32) -> Option<SectionSpan> {
-        let section = &studio.sections[drag.index];
-        let length = studio.patterns[section.pattern].length;
-        let previous = section.bars(length);
-        let available = MAX_SONG_BARS
-            .saturating_sub(studio.song_bars() - previous)
-            .max(previous);
-        let delta = (delta / self.bar_width).round() as i32;
-        let change = if drag.mode == DragMode::Start {
-            -delta
-        } else {
-            delta
-        };
-        let bars = (previous as i32 + change).clamp(1, available as i32) as usize;
-        if bars != previous {
-            let mut offset = section.offset(length) as i32;
-            if drag.mode == DragMode::Start {
-                offset += previous as i32 - bars as i32;
-            }
-            Some(SectionSpan {
-                bars,
-                offset: offset.rem_euclid(length as i32) as usize,
-            })
-        } else {
-            section.span
-        }
+        (rect.width(), edit)
     }
 }
 
@@ -402,9 +396,9 @@ fn section_rects(
 fn drag_mode(rect: Rect, x: f32) -> DragMode {
     let handle = (rect.width() * 0.24).min(10.0);
     if x <= rect.left() + handle {
-        DragMode::Start
+        DragMode::Trim(Edge::Start)
     } else if x >= rect.right() - handle {
-        DragMode::End
+        DragMode::Trim(Edge::End)
     } else {
         DragMode::Move
     }
@@ -428,14 +422,19 @@ mod tests {
     #[test]
     fn timeline_drags_and_resizes_sections_and_duplicates_the_selected_span() {
         let ctx = egui::Context::default();
-        let mut studio = Studio {
+        let mut app = crate::app::App::new(ctx.clone());
+        app.audio.remove_output();
+        app.project.studio = Studio {
             bars: 2,
             ..Studio::default()
         };
+        let studio = &mut app.project.studio;
+        studio.hits[0][0][0] = 1;
         studio.save_pattern("Intro", false);
         studio.save_pattern("Verse", true);
         studio.save_pattern("Hook", true);
         studio.bars = 2;
+        studio.hits[1][0][0] = 2;
         studio.sync_pattern();
         studio.sections = vec![
             Section::new(SectionKind::Intro, 0, 1),
@@ -445,18 +444,22 @@ mod tests {
         let target = AutomationTarget::MasterVolume;
         let intro = [AutomationPoint {
             tick: 0,
-            percent: 23, curve: Default::default() }];
+            percent: 23,
+            curve: Default::default(),
+        }];
         let hook = [AutomationPoint {
             tick: 0,
-            percent: 61, curve: Default::default() }];
+            percent: 61,
+            curve: Default::default(),
+        }];
         studio.sections[0]
             .automation
             .set_points(target, intro.to_vec());
         studio.sections[2]
             .automation
             .set_points(target, hook.to_vec());
-        let mut timeline = Timeline::default();
-        let render = |studio: &mut Studio, timeline: &mut Timeline, events| {
+        app.observe_edits(false);
+        let render = |app: &mut crate::app::App, events| {
             let _ = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 200.0))),
@@ -467,12 +470,17 @@ mod tests {
                     egui::CentralPanel::default()
                         .frame(egui::Frame::NONE)
                         .show(ctx, |ui| {
-                            timeline.show(ui, studio, None, true);
+                            if let Some(edit) =
+                                app.view.arrangement_timeline
+                                    .show(ui, &mut app.project.studio, None, true)
+                            {
+                                app.edit_arrangement(edit);
+                            }
                         });
                 },
             );
         };
-        let drag = |studio: &mut Studio, timeline: &mut Timeline, from, to| {
+        let drag = |app: &mut crate::app::App, from, to| {
             let button = |pos, pressed| egui::Event::PointerButton {
                 pos,
                 pressed,
@@ -481,41 +489,61 @@ mod tests {
             };
             let start = pos2(from, 40.0);
             let end = pos2(to, 40.0);
+            let before = app.project.studio.sections.clone();
             render(
-                studio,
-                timeline,
+                app,
                 vec![egui::Event::PointerMoved(start), button(start, true)],
             );
-            render(studio, timeline, vec![egui::Event::PointerMoved(end)]);
-            render(studio, timeline, vec![button(end, false)]);
+            render(app, vec![egui::Event::PointerMoved(end)]);
+            assert_eq!(app.project.studio.sections, before);
+            render(app, vec![button(end, false)]);
         };
-        render(&mut studio, &mut timeline, vec![]);
-        drag(&mut studio, &mut timeline, 72.0, 310.0);
+        render(&mut app, vec![]);
+        let initial = app.project.studio.sections.clone();
+        drag(&mut app, 72.0, 310.0);
         assert_eq!(
-            studio
+            app.project.studio
                 .sections
                 .iter()
                 .map(|section| section.pattern)
                 .collect::<Vec<_>>(),
             [1, 2, 0]
         );
-        assert_eq!(studio.sections[2].automation.points(target), intro);
-        drag(&mut studio, &mut timeline, 213.0, 285.0);
+        assert_eq!(app.project.studio.sections[2].automation.points(target), intro);
+        assert_eq!(app.view.arrangement_timeline.selected, Some(2));
+        app.undo_project(false);
+        assert_eq!(app.project.studio.sections, initial);
+        assert_eq!(app.view.arrangement_timeline.selected, Some(0));
+        app.undo_project(true);
+        assert_eq!(app.view.arrangement_timeline.selected, Some(2));
+
+        drag(&mut app, 213.0, 285.0);
         assert_eq!(
-            studio.sections[1].span,
+            app.project.studio.sections[1].span,
             Some(SectionSpan { offset: 0, bars: 3 })
         );
-        assert_eq!(studio.song_bars(), 6);
-        drag(&mut studio, &mut timeline, 75.0, 147.0);
+        assert_eq!(app.project.studio.song_bars(), 6);
+        drag(&mut app, 75.0, 147.0);
         assert_eq!(
-            studio.sections[1].span,
+            app.project.studio.sections[1].span,
             Some(SectionSpan { offset: 1, bars: 2 })
         );
-        timeline.duplicate(&mut studio);
-        assert_eq!(studio.sections[2], studio.sections[1]);
-        studio.sections[2].automation.set_points(target, Vec::new());
-        assert_eq!(studio.sections[1].automation.points(target), hook);
-        assert_eq!(timeline.selected, Some(2));
-        assert_eq!(studio.song_bars(), 7);
+        let song = app.project.studio.song_sequence().unwrap();
+        assert_eq!(song.bars[1].drums[0][0], 2);
+        assert_eq!(song.bars[3].drums[0][0], 1);
+        app.undo_project(false);
+        assert_eq!(
+            app.project.studio.sections[1].span,
+            Some(SectionSpan { offset: 0, bars: 3 })
+        );
+        app.undo_project(true);
+        app.edit_arrangement(Edit::Duplicate(1));
+        assert_eq!(app.project.studio.sections[2], app.project.studio.sections[1]);
+        assert_eq!(app.view.arrangement_timeline.selected, Some(2));
+        assert_eq!(app.project.studio.song_bars(), 7);
+        app.undo_project(false);
+        assert_eq!(app.project.studio.sections.len(), 3);
+        assert_eq!(app.project.studio.sections[1].automation.points(target), hook);
+        assert_eq!(app.view.arrangement_timeline.selected, Some(1));
     }
 }

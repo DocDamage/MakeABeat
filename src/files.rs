@@ -1,6 +1,6 @@
 use crate::audio::{Clip, Command, Mixer, RENDER_RATE, noise};
-use crate::model::{Library, NamedSample, Record, STEPS, Sequence, Source, Studio};
-use serde::{Deserialize, Serialize};
+use crate::model::{Library, NamedSample, Record, STEPS, Sequence, Source, Studio, project::Project};
+use serde::Deserialize;
 use std::{
     error::Error,
     f32::consts::TAU,
@@ -370,25 +370,6 @@ fn download(url: &str) -> Result<Clip> {
     decode(Box::new(Cursor::new(bytes)), extension)
 }
 
-#[derive(Default, PartialEq, Serialize, Deserialize)]
-pub struct Project {
-    pub record: Option<Record>,
-    pub studio: Studio,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub samples: Vec<NamedSample>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub source_ids: Vec<crate::model::snapshot::SourceId>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub snapshots: Arc<Vec<crate::model::snapshot::NamedSnapshot>>,
-}
-
-impl Project {
-    fn uses_extraction(&self) -> bool {
-        self.record.iter().chain(&self.studio.sources)
-            .any(|record| matches!(record.source, Source::Extracted(_)))
-    }
-}
-
 pub fn publish_export(path: &Path, render: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
     let directory = path.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let staging = tempfile::tempdir_in(directory)?;
@@ -660,7 +641,7 @@ pub fn bounce_window(
         return Err("The mix is too long for the remaining project audio space.".into());
     }
     let mut mixer = Mixer::new(RENDER_RATE);
-    mixer.settings = studio;
+    mixer.settings = (&studio).into();
     mixer.command(Command::Clip(clip));
     mixer.command(match bars {
         Some(bars) => Command::SongWindow(sequence, 1, bars, false),
@@ -703,7 +684,7 @@ pub(crate) fn render_wav_with(
             RenderPart::Keys => StemRoute::Keys,
             _ => StemRoute::All,
         };
-        mixer.settings = studio;
+        mixer.settings = (&studio).into();
         mixer.command(Command::Clip(clip));
         mixer.command(Command::Song(sequence, 1));
         let spec = hound::WavSpec {
@@ -897,7 +878,7 @@ pub fn export_midi_sequence_mode(path: &Path, studio: &Studio, sequence: &Sequen
             let column = Cell::column(&data.drums, data.pads[step], data.keys[step], data.metadata(), step);
             for (row, cell) in column.into_iter().enumerate() {
                 if let Some(cell) = cell {
-                    cell.resolve(studio, row, absolute, cycle, false).for_each(&mut add);
+                    cell.resolve(studio.step_timing(), row, absolute, cycle, false).for_each(&mut add);
                 }
             }
         }
@@ -1147,6 +1128,38 @@ pub fn export_csv(path: &Path, library: &Library) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn older_crates_keep_their_interface_preferences_and_defaults() -> Result<()> {
+        let folder = tempfile::tempdir()?;
+        let path = folder.path().join("crate.json");
+        std::fs::write(&path, br#"{"records":[],"collections":[],"heard":7}"#)?;
+        let (library, recovery) = read_library_at(&path);
+        assert!(recovery.is_none());
+        assert_eq!(library.heard, 7);
+        assert_eq!(library.interface, Default::default());
+
+        std::fs::write(
+            &path,
+            br#"{"records":[],"collections":[],"heard":7,"interface":{"zoom":1.25,"high_contrast":true,"show_pads":false}}"#,
+        )?;
+        let (library, recovery) = read_library_at(&path);
+        assert!(recovery.is_none());
+        assert_eq!(
+            library.interface,
+            crate::model::preferences::Preferences {
+                zoom: 1.25,
+                high_contrast: true,
+                show_pads: false,
+                ..Default::default()
+            }
+        );
+        write_library_at(&path, &library)?;
+        let (reopened, recovery) = read_library_at(&path);
+        assert!(recovery.is_none());
+        assert_eq!(reopened.interface, library.interface);
+        Ok(())
+    }
 
     #[test]
     fn damaged_crate_preserves_its_bytes_and_restores_the_previous_good_save() -> Result<()> {

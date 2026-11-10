@@ -71,7 +71,7 @@ pub fn show(app: &mut App, ctx: &Context, editor: &mut Editor) -> bool {
                 );
                 small(
                     ui,
-                    format!("Preview plays at project tempo · {} BPM", app.studio.bpm),
+                    format!("Preview plays at project tempo · {} BPM", app.project.studio.bpm),
                 );
             }
             let has_downbeat = editor.has_downbeat();
@@ -156,7 +156,7 @@ pub fn show(app: &mut App, ctx: &Context, editor: &mut Editor) -> bool {
         }
         ui.separator();
         ui.horizontal_wrapped(|ui| {
-            if action(ui, "Hear source", app.output.is_some() && !app.recording).clicked() {
+            if action(ui, "Hear source", app.audio.output().is_some() && !app.recording).clicked() {
                 app.listen_transcription_source(editor);
             }
             sound_picker(app, ui, &mut editor.sound);

@@ -8,7 +8,7 @@ use eframe::egui::{self, Ui};
 
 pub(super) fn panel(app: &mut App, ui: &mut Ui) {
     small(ui, "SAM Audio Small runs locally on a CUDA GPU. Select 0.10–6 seconds. The previews and saved sources are mono.");
-    if let Some(Source::Extracted(origin)) = app.source_record(app.active_source).map(|record| &record.source) {
+    if let Some(Source::Extracted(origin)) = app.source_record(app.media.active_source()).map(|record| &record.source) {
         let rate = f64::from(origin.sample_rate);
         small(ui, format!("{} from {} · {:.2}–{:.2} s · {}",
             if origin.residual { "Residual" } else { "Target" },
@@ -66,7 +66,7 @@ pub(super) fn panel(app: &mut App, ui: &mut Ui) {
     }
     if app.extraction_ready() {
         ui.horizontal_wrapped(|ui| {
-            let can_play = app.output.is_some() && !app.recording && app.input_recording.is_none();
+            let can_play = app.audio.output().is_some() && !app.recording && app.input_recording.is_none();
             for (label, part) in [
                 ("Original", Part::Original), ("Target", Part::Target), ("Residual", Part::Residual),
             ] {

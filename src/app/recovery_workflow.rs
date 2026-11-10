@@ -1,7 +1,8 @@
 use crate::{
     audio::Clip,
     background::Control,
-    files::{Project, recovery},
+    files::recovery,
+    model::project::Project,
 };
 use eframe::egui;
 use std::{
