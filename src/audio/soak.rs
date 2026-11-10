@@ -8,6 +8,8 @@ use std::{
 };
 use windows::Win32::System::Threading::THREAD_PRIORITY_TIME_CRITICAL;
 
+mod endpoint;
+
 const PILOT_HZ: f32 = 6_000.0;
 const REFERENCE_HZ: f32 = 4_700.0;
 const PILOT_LEVEL: f32 = 0.004;
@@ -418,6 +420,7 @@ fn windows_audio_dropout_soak() -> files::Result<()> {
         .transpose()?
         .unwrap_or(1_800);
     assert!(seconds > 0);
+    let mut endpoint = endpoint::Endpoint::open()?;
     let output = Output::open(&OutputSettings::default())?;
     let device = cpal::default_host()
         .default_output_device()
@@ -479,6 +482,8 @@ fn windows_audio_dropout_soak() -> files::Result<()> {
     let mut calibration = [[0.0_f32; 75]; 2];
     let mut index = 0;
     while index < calibration[0].len() {
+        endpoint.sample_other_audio()?;
+        endpoint.require_quiet()?;
         if output.meters.beat_audition() == 2 {
             let levels = unpack(stats.recent_level.load(Relaxed));
             for (band, level) in levels.into_iter().enumerate() {
@@ -533,9 +538,20 @@ fn windows_audio_dropout_soak() -> files::Result<()> {
         stats.thread_priority.load(Relaxed),
     );
     let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(seconds) && !background.is_finished() {
-        let remaining = Duration::from_secs(seconds).saturating_sub(start.elapsed());
-        thread::sleep(remaining.min(Duration::from_secs(30)));
+    let duration = Duration::from_secs(seconds);
+    let mut next_report = Duration::from_secs(30).min(duration);
+    let mut endpoint_result = Ok(());
+    while start.elapsed() < duration && !background.is_finished() {
+        let remaining = duration.saturating_sub(start.elapsed());
+        thread::sleep(remaining.min(Duration::from_millis(10)));
+        if let Err(error) = endpoint.sample_other_audio() {
+            endpoint_result = Err(error);
+            break;
+        }
+        if start.elapsed() < next_report {
+            continue;
+        }
+        next_report += Duration::from_secs(30);
         received.try_iter().for_each(Event::print);
         println!(
             "Elapsed {:.0}s, windows {}, weak both {}, audition {}, reference {}, capture gaps {}, callback peak {:.3} ms, cycles {}, CLAP passages {}",
@@ -566,6 +582,8 @@ fn windows_audio_dropout_soak() -> files::Result<()> {
         render.weak_audition.load(Relaxed),
         render.weak_reference.load(Relaxed)
     );
+    endpoint_result?;
+    endpoint.require_quiet()?;
     assert!(start.elapsed() >= Duration::from_secs(seconds));
     assert!(!output.meters.failed() && !stats.failed.load(Relaxed));
     assert!(

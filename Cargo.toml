@@ -29,7 +29,7 @@ windows = { version = "0.62.2", features = ["Win32_Security", "Win32_System_Com"
 windows-core = "0.62.2"
 
 [target.'cfg(windows)'.dev-dependencies]
-windows = { version = "0.62.2", features = ["Win32_System_WindowsProgramming"] }
+windows = { version = "0.62.2", features = ["Win32_Media_Audio_Endpoints", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_System_WindowsProgramming"] }
 
 [profile.release]
 lto = "thin"
