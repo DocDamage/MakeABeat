@@ -2153,11 +2153,12 @@ fn loop_panel(app: &mut App, ui: &mut Ui) {
             waveform_ruler(app, ui);
         }
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), app.wave_height), Sense::hover());
+        let colors = app.library.interface.control_colors();
         ui.painter().rect(
             rect,
             6.0,
             BG,
-            Stroke::new(1.0_f32, EDGE),
+            Stroke::new(1.0_f32, colors.edge),
             StrokeKind::Inside,
         );
         timeline_at(app, ui, rect.shrink(6.0), "studio_wave", true);
@@ -2283,6 +2284,7 @@ fn waveform_zoom(app: &mut App, ui: &mut Ui) {
 }
 
 fn waveform_ruler(app: &App, ui: &mut Ui) {
+    let text_color = app.library.interface.control_colors().secondary_text;
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 18.0), Sense::hover());
     let (start, end) = app.waveform.range(app.duration());
     let span = end - start;
@@ -2314,13 +2316,16 @@ fn waveform_ruler(app: &App, ui: &mut Ui) {
         } else {
             time(at, false)
         };
-        painter.vline(x, rect.bottom() - 5.0..=rect.bottom(), Stroke::new(1.0_f32, DIM));
-        painter.text(pos2(x + 3.0, rect.top()), Align2::LEFT_TOP, text, FontId::monospace(11.0), DIM);
+        painter.vline(x, rect.bottom() - 5.0..=rect.bottom(), Stroke::new(1.0_f32, text_color));
+        painter.text(pos2(x + 3.0, rect.top()), Align2::LEFT_TOP, text, FontId::monospace(11.0), text_color);
     }
 }
 
 fn waveform_overview(app: &mut App, ui: &mut Ui) {
     let Some(clip) = app.active_clip() else { return };
+    let interface = app.library.interface;
+    let colors = interface.control_colors();
+    let trace = if interface.high_contrast { colors.secondary_text } else { FAINT };
     let duration = clip.duration();
     let (rect, response) =
         ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::click_and_drag());
@@ -2333,7 +2338,7 @@ fn waveform_overview(app: &mut App, ui: &mut Ui) {
         p.vline(
             x,
             cy - amplitude..=cy + amplitude,
-            Stroke::new(1.0_f32, FAINT),
+            Stroke::new(1.0_f32, trace),
         );
     }
     let (start, end) = app.waveform.range(duration);
@@ -2343,7 +2348,7 @@ fn waveform_overview(app: &mut App, ui: &mut Ui) {
         visible,
         3.0,
         Color32::from_black_alpha(28),
-        Stroke::new(1.0_f32, GREEN),
+        Stroke::new(colors.emphasis, colors.accent),
         StrokeKind::Inside,
     );
     if (response.clicked() || response.dragged())
@@ -2770,6 +2775,8 @@ fn timeline_at(app: &mut App, ui: &mut Ui, rect: Rect, id: &str, select_loop: bo
         None
     };
     let drag_range = drag.map(|(_, range)| range);
+    let interface = app.library.interface;
+    let colors = interface.control_colors();
     let painter = ui.painter_at(rect);
     if select_loop {
         beat_map::paint(app, &painter, rect, visible.clone());
@@ -2811,14 +2818,14 @@ fn timeline_at(app: &mut App, ui: &mut Ui, rect: Rect, id: &str, select_loop: bo
             Color32::from_rgba_unmultiplied(0, 195, 133, 25),
         );
     }
-    let stereo = select_loop && app.library.interface.stereo_waveform;
+    let stereo = select_loop && interface.stereo_waveform;
     let centers = if stereo {
         [cy - rect.height() * 0.25, cy + rect.height() * 0.25]
     } else {
         [cy; 2]
     };
     for &center in centers.iter().take(if stereo { 2 } else { 1 }) {
-        painter.hline(rect.x_range(), center, Stroke::new(1.0_f32, EDGE));
+        painter.hline(rect.x_range(), center, Stroke::new(1.0_f32, colors.edge));
     }
     let zoomed = select_loop && app.waveform.zoom > 1.0;
     let bins = if zoomed {
@@ -2826,9 +2833,14 @@ fn timeline_at(app: &mut App, ui: &mut Ui, rect: Rect, id: &str, select_loop: bo
     } else {
         clip.peaks.len()
     };
+    let unplayed = if interface.high_contrast {
+        colors.secondary_text
+    } else {
+        Color32::from_rgb(85, 105, 96)
+    };
     for index in 0..bins {
         let x = rect.left() + (index as f32 + 0.5) / bins as f32 * rect.width();
-        let color = if x < at(app.position) { MINT } else { Color32::from_rgb(85, 105, 96) };
+        let color = if x < at(app.position) { MINT } else { unplayed };
         let start = visible_start + span * index as f64 / bins as f64;
         let end = visible_start + span * (index + 1) as f64 / bins as f64;
         let peaks = if stereo {
@@ -2862,12 +2874,12 @@ fn timeline_at(app: &mut App, ui: &mut Ui, rect: Rect, id: &str, select_loop: bo
         .filter(|point| visible.contains(point))
     {
         let x = at(point);
-        painter.vline(x, rect.y_range(), Stroke::new(1.0_f32, GREEN));
+        painter.vline(x, rect.y_range(), Stroke::new(colors.emphasis, colors.accent));
         if select_loop && (loop_range.is_some() || drag_range.is_some()) {
             painter.rect_filled(
                 Rect::from_center_size(pos2(x, rect.top() + 6.0), vec2(10.0, 12.0)),
                 2.0,
-                GREEN,
+                colors.accent,
             );
         }
     }
@@ -2882,7 +2894,7 @@ fn timeline_at(app: &mut App, ui: &mut Ui, rect: Rect, id: &str, select_loop: bo
         }
     }
     if visible.contains(&app.position) {
-        painter.vline(at(app.position), rect.y_range(), Stroke::new(1.5_f32, TEXT));
+        painter.vline(at(app.position), rect.y_range(), Stroke::new(colors.emphasis.max(1.5), colors.focus));
     }
     if select_loop && response.drag_stopped() {
         ui.data_mut(|data| data.remove::<WaveDrag>(selection_id));
@@ -3458,6 +3470,8 @@ fn draw_piano_keys(app: &mut App, ui: &mut Ui) {
 
 fn pad_cell(app: &mut App, ui: &mut Ui, index: usize, size: f32) {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
+    let interface = app.library.interface;
+    let colors = interface.control_colors();
     let assigned = app.studio.pads[index];
     response.widget_info(|| {
         WidgetInfo::labeled(
@@ -3490,12 +3504,21 @@ fn pad_cell(app: &mut App, ui: &mut Ui, index: usize, size: f32) {
     } else {
         INSET
     };
+    let border = if response.has_focus() {
+        Stroke::new(colors.emphasis, colors.focus)
+    } else if drop_target {
+        Stroke::new(colors.emphasis, GOLD)
+    } else if selected {
+        Stroke::new(colors.emphasis, colors.accent)
+    } else {
+        Stroke::new(1.0_f32, colors.edge)
+    };
     let p = ui.painter_at(rect);
     p.rect(
         rect,
         6.0,
         fill,
-        Stroke::new(1.0_f32, if response.has_focus() { TEXT } else if drop_target { GOLD } else if selected { GREEN } else { EDGE }),
+        border,
         StrokeKind::Inside,
     );
     p.text(
@@ -3503,7 +3526,7 @@ fn pad_cell(app: &mut App, ui: &mut Ui, index: usize, size: f32) {
         Align2::LEFT_TOP,
         format!("{:02}", index + 1),
         FontId::monospace(11.0),
-        if assigned.is_some() { tint } else { DIM },
+        if assigned.is_some() { tint } else { colors.secondary_text },
     );
     let cap = Rect::from_min_size(
         pos2(rect.right() - 25.0, rect.top() + 7.0),
@@ -3513,7 +3536,7 @@ fn pad_cell(app: &mut App, ui: &mut Ui, index: usize, size: f32) {
         cap,
         4.0,
         Color32::from_black_alpha(34),
-        Stroke::new(1.0_f32, EDGE),
+        Stroke::new(1.0_f32, colors.edge),
         StrokeKind::Inside,
     );
     p.text(
@@ -3521,19 +3544,20 @@ fn pad_cell(app: &mut App, ui: &mut Ui, index: usize, size: f32) {
         Align2::CENTER_CENTER,
         PAD_LABELS[index],
         FontId::monospace(11.0),
-        DIM,
+        colors.secondary_text,
     );
     if let Some(clip) = app.clip.as_deref().and_then(|root| root.source(app.studio.pad_sources[index]))
         && let Some((start, end)) = app.pad_range(index)
     {
         let waveform = rect.shrink2(vec2(8.0, 25.0));
         let bins = 18;
+        let trace = if interface.high_contrast { tint } else { tint.gamma_multiply(0.75) };
         for bin in 0..bins {
             let low = start + (end - start) * f64::from(bin) / f64::from(bins);
             let high = start + (end - start) * f64::from(bin + 1) / f64::from(bins);
             let x = waveform.left() + waveform.width() * (bin as f32 + 0.5) / bins as f32;
             let half = clip.peak_between(low, high) * waveform.height().max(0.0) * 0.42;
-            p.vline(x, waveform.center().y - half..=waveform.center().y + half, Stroke::new(1.0_f32, tint.gamma_multiply(0.75)));
+            p.vline(x, waveform.center().y - half..=waveform.center().y + half, Stroke::new(1.0_f32, trace));
         }
     }
     p.text(
@@ -3545,7 +3569,7 @@ fn pad_cell(app: &mut App, ui: &mut Ui, index: usize, size: f32) {
             name.chars().take(if size < 75.0 { 8 } else { 13 }).collect()
         },
         FontId::monospace(11.0),
-        if assigned.is_some() { MINT } else { FAINT },
+        if assigned.is_some() { MINT } else if interface.high_contrast { colors.secondary_text } else { FAINT },
     );
     if let Some(cut) = response.dnd_release_payload::<CutDrag>() {
         app.selected_pad = index;

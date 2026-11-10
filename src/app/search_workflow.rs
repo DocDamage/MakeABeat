@@ -37,6 +37,7 @@ struct LinkedSource {
 #[derive(Default)]
 pub(crate) struct Search {
     pub text: String,
+    pub by_sound: bool,
     pub tag: String,
     pub filters: Filters,
     pub summary: Summary,
@@ -121,18 +122,32 @@ impl App {
             return;
         };
         let tag = self.search.tag.trim().to_owned();
+        let by_sound = self.search.by_sound;
         self.change_index(
             "Adding sample folder",
-            move |index| index.add_folder(&path, &tag),
-            true,
+            move |index| {
+                index.add_folder(&path, &tag)?;
+                if !by_sound {
+                    index.scan()?;
+                }
+                Ok(())
+            },
+            by_sound,
         );
     }
 
     pub fn index_search_downloads(&mut self) {
+        let by_sound = self.search.by_sound;
         self.change_index(
             "Adding cached downloads",
-            |index| index.add_downloads(),
-            true,
+            move |index| {
+                index.add_downloads()?;
+                if !by_sound {
+                    index.scan()?;
+                }
+                Ok(())
+            },
+            by_sound,
         );
     }
 
@@ -173,7 +188,7 @@ impl App {
                 }
                 Ok(())
             },
-            true,
+            self.search.by_sound,
         );
     }
 
@@ -193,16 +208,20 @@ impl App {
         self.change_index("Resetting passage analysis", |index| index.rebuild(), true);
     }
 
+    pub fn rescan_search_files(&mut self) {
+        self.change_index("Scanning local files", Index::scan, false);
+    }
+
     fn change_index(
         &mut self,
         label: &'static str,
-        action: impl Fn(&Index) -> files::Result<()> + Send + Sync + 'static,
+        action: impl Fn(&mut Index) -> files::Result<()> + Send + Sync + 'static,
         resume: bool,
     ) {
         self.search.status = None;
         self.submit_search(label, Priority::Foreground, move || {
-            let index = open_index()?;
-            action(&index)?;
+            let mut index = open_index()?;
+            action(&mut index)?;
             Ok(Completion::Updated(index.summary()?, resume))
         });
     }
@@ -224,8 +243,28 @@ impl App {
 
     pub fn search_sample_text(&mut self) {
         let text = self.search.text.trim().to_owned();
-        if !text.is_empty() {
-            self.find_samples(text.clone(), Query::Text(text));
+        if self.search.by_sound {
+            if !text.is_empty() {
+                self.find_samples(text.clone(), Query::Text(text));
+            }
+        } else {
+            let description = if text.is_empty() {
+                "Local files".into()
+            } else {
+                format!("Files matching {text}")
+            };
+            self.submit_query(description, move |index, filters| {
+                search::search_files(index, &text, filters, 40)
+            });
+        }
+    }
+
+    pub fn set_search_mode(&mut self, by_sound: bool) {
+        if self.search.by_sound != by_sound {
+            self.search.by_sound = by_sound;
+            self.search.revision += 1;
+            self.search.results.clear();
+            self.search.results_for = None;
         }
     }
 
@@ -239,12 +278,28 @@ impl App {
         let name = cut.name.clone();
         let query = Query::Cut(clip, cut.range(), self.match_priority);
         self.open_search();
+        self.set_search_mode(true);
         self.find_samples(format!("Similar to {name}"), query);
     }
 
     fn find_samples(&mut self, description: String, query: Query) {
         let python = self.search_python();
         let worker = self.search.worker.clone();
+        self.submit_query(description, move |index, filters| {
+            let embedding = Worker::with(
+                &mut *worker.lock().map_err(|_| "CLAP worker is unavailable.")?,
+                &python,
+                |worker| query.embed(worker),
+            )?;
+            search::rank(index, &embedding, filters, 40)
+        });
+    }
+
+    fn submit_query(
+        &mut self,
+        description: String,
+        query: impl Fn(&Index, &Filters) -> files::Result<Vec<Hit>> + Send + Sync + 'static,
+    ) {
         let filters = self.search.filters.clone();
         self.search.revision += 1;
         let revision = self.search.revision;
@@ -253,15 +308,7 @@ impl App {
             "Searching local samples",
             Priority::Interactive,
             move || {
-                let run = || -> files::Result<Vec<Hit>> {
-                    let index = open_index()?;
-                    let embedding = Worker::with(
-                        &mut *worker.lock().map_err(|_| "CLAP worker is unavailable.")?,
-                        &python,
-                        |worker| query.embed(worker),
-                    )?;
-                    search::rank(&index, &embedding, &filters, 40)
-                };
+                let run = || query(&open_index()?, &filters);
                 Ok(Completion::Ranked(
                     revision,
                     description.clone(),

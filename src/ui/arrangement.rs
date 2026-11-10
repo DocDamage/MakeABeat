@@ -14,6 +14,15 @@ pub(crate) use timeline::Timeline;
 
 pub(super) fn show(app: &mut App, ui: &mut Ui) {
     let playing = app.song_playing.is_some();
+    if app.studio.patterns.is_empty() {
+        small(ui, "Save the current grid as your first pattern, then add it to the timeline.");
+        if primary(ui, "Create first pattern", !playing && !app.recording).clicked() {
+            if app.pattern_name.trim().is_empty() {
+                app.pattern_name = app.studio.next_pattern_name();
+            }
+            app.create_pattern(false);
+        }
+    }
     scene_launcher(app, ui);
     let pattern_list_height = if app.arrangement_timeline.automation.is_some() { 58.0 } else { 103.0 };
     ui.add_enabled_ui(!playing && !app.recording, |ui| {
@@ -105,7 +114,9 @@ pub(super) fn show(app: &mut App, ui: &mut Ui) {
         }
     });
     if studio.sections.is_empty() {
-        small(ui, "Save a pattern, then add a section and choose its pattern and repeats.");
+        if !studio.patterns.is_empty() {
+            small(ui, "Use Add section to place a pattern on the timeline.");
+        }
     } else {
         if let Some(editor) = &mut timeline.automation {
             editor.controls(ui, studio, &mut timeline.selected, &mut timeline.automation_clipboard, editable);

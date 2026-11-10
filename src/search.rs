@@ -43,6 +43,28 @@ pub struct Location {
 }
 
 impl Location {
+    fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            path: PathBuf::from(row.get::<_, String>(0)?),
+            title: row.get(1)?,
+            origin: row
+                .get::<_, Option<String>>(2)?
+                .and_then(|json| serde_json::from_str(&json).ok()),
+            timeline: row.get(3)?,
+            stamp: Stamp {
+                bytes: row.get(4)?,
+                modified: row.get(5)?,
+            },
+            kind: Kind::ALL[row.get::<_, usize>(6)?.min(2)],
+            bpm: row.get(7)?,
+            instrument: row.get(8)?,
+        })
+    }
+
+    fn current(&self) -> bool {
+        Stamp::read(&self.path).ok().as_ref() == Some(&self.stamp)
+    }
+
     pub fn matches_source(&self, source: &Source) -> bool {
         self.origin
             .as_ref()
@@ -57,14 +79,14 @@ impl Location {
 pub struct Hit {
     pub location: Location,
     pub range: (f64, f64),
-    pub score: f32,
+    pub score: Option<f32>,
     content: String,
 }
 
 impl Hit {
     pub fn load(&self) -> Result<Clip> {
         let validate = || -> Result<()> {
-            if Stamp::read(&self.location.path).ok().as_ref() != Some(&self.location.stamp) {
+            if !self.location.current() {
                 return Err("This recording changed or is missing. Rescan the index.".into());
             }
             Ok(())
@@ -77,6 +99,64 @@ impl Hit {
         }
         Ok(clip)
     }
+}
+
+pub fn search_files(index: &Index, text: &str, filters: &Filters, limit: usize) -> Result<Vec<Hit>> {
+    background::stage("Searching filenames and tags")?;
+    let text = text.to_lowercase();
+    let mut query = index.db.prepare(
+        "SELECT l.path,l.title,l.origin,l.timeline,l.bytes,l.modified,r.kind,
+                coalesce(l.bpm,b.bpm),coalesce(l.tag,r.tag)
+         FROM locations l JOIN roots r ON r.key=l.root
+         LEFT JOIN builds b ON b.content=l.content AND b.model=?1
+         WHERE (?2 IS NULL OR r.kind=?2)
+             AND (?3=0 OR coalesce(l.bpm,b.bpm)>=?3)
+             AND (?4=0 OR coalesce(l.bpm,b.bpm)<=?4)
+         ORDER BY l.title COLLATE NOCASE,l.path,r.kind DESC,l.id",
+    )?;
+    let candidates = query.query_map(
+        params![MODEL, filters.source.map(|kind| kind as i64), filters.min_bpm, filters.max_bpm],
+        Location::read,
+    )?;
+    let instrument = filters.instrument.trim().to_lowercase();
+    let mut hits = Vec::new();
+    let mut seen = HashSet::new();
+    for location in candidates {
+        if hits.len() >= limit {
+            break;
+        }
+        background::check()?;
+        let location = location?;
+        let tag = location.instrument.to_lowercase();
+        let title = location.title.to_lowercase();
+        let filename = location.path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+        if !tag.contains(&instrument)
+            || !text.split_whitespace().all(|word| {
+                title.contains(word) || filename.contains(word) || tag.contains(word)
+            })
+            || !location.current()
+        {
+            continue;
+        }
+        let Ok(duration) = files::audio_duration(&location.path) else {
+            continue;
+        };
+        if duration < filters.min_seconds
+            || (filters.max_seconds > 0.0 && duration > filters.max_seconds)
+            || !location.current()
+            || !seen.insert((location.path.clone(), location.timeline.to_bits()))
+        {
+            continue;
+        }
+        hits.push(Hit {
+            location,
+            range: (0.0, duration),
+            score: None,
+            content: String::new(),
+        });
+    }
+    background::check()?;
+    Ok(hits)
 }
 
 pub struct Embedding {
@@ -210,7 +290,8 @@ pub fn rank(
         if hits.len() == limit {
             if hits
                 .last()
-                .is_none_or(|hit| candidate.score < hit.score - 0.055)
+                .and_then(|hit| hit.score)
+                .is_none_or(|score| candidate.score < score - 0.055)
             {
                 break;
             }
@@ -237,27 +318,11 @@ pub fn rank(
                 ])?;
                 let mut found = None;
                 while let Some(row) = rows.next()? {
-                    let path = PathBuf::from(row.get::<_, String>(0)?);
-                    let stamp = Stamp {
-                        bytes: row.get(4)?,
-                        modified: row.get(5)?,
-                    };
-                    if Stamp::read(&path).ok().as_ref() != Some(&stamp) {
-                        continue;
+                    let location = Location::read(row)?;
+                    if location.current() {
+                        found = Some(location);
+                        break;
                     }
-                    found = Some(Location {
-                        path,
-                        stamp,
-                        title: row.get(1)?,
-                        origin: row
-                            .get::<_, Option<String>>(2)?
-                            .and_then(|json| serde_json::from_str(&json).ok()),
-                        timeline: row.get(3)?,
-                        kind: Kind::ALL[row.get::<_, usize>(6)?.min(2)],
-                        bpm: row.get(7)?,
-                        instrument: row.get(8)?,
-                    });
-                    break;
                 }
                 entry.insert(found)
             }
@@ -285,7 +350,7 @@ pub fn rank(
             };
             if hit.location.path == location.path
                 && union.1 - union.0 <= cap
-                && candidate.score >= hit.score - 0.055
+                && hit.score.is_some_and(|score| candidate.score >= score - 0.055)
             {
                 hit.range = union;
             }
@@ -298,7 +363,7 @@ pub fn rank(
             hits.push(Hit {
                 location: location.clone(),
                 range: candidate.range,
-                score: candidate.score,
+                score: Some(candidate.score),
                 content: content.to_owned(),
             });
         }
@@ -330,6 +395,53 @@ mod tests {
             .and_then(Path::file_name)
             .and_then(|name| name.to_str())
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn file_search_filters_unembedded_audio_and_rejects_stale_paths() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let samples = temp.path().join("samples");
+        std::fs::create_dir(&samples)?;
+        let snare = samples.join("Bright Snare.wav");
+        let kick = samples.join("Kick.wav");
+        for (path, frames) in [(&snare, 8_000), (&kick, 16_000)] {
+            let mut writer = hound::WavWriter::create(
+                path,
+                hound::WavSpec {
+                    channels: 1,
+                    sample_rate: 8_000,
+                    bits_per_sample: 16,
+                    sample_format: hound::SampleFormat::Int,
+                },
+            )?;
+            for _ in 0..frames {
+                writer.write_sample(0_i16)?;
+            }
+            writer.finalize()?;
+        }
+        let mut index = Index::open(&temp.path().join("index"))?;
+        index.add_folder(&samples, "DRUMS")?;
+        index.scan()?;
+        assert_eq!(index.summary()?.passages, 0);
+        assert_eq!(search_files(&index, "", &Filters::default(), 40)?.len(), 2);
+
+        let filters = Filters {
+            source: Some(Kind::Folder),
+            max_seconds: 1.5,
+            ..Filters::default()
+        };
+        let hits = search_files(&index, "drums SNARE", &filters, 40)?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].location.title, "Bright Snare");
+        assert_eq!(hits[0].range, (0.0, 1.0));
+        assert_eq!(hits[0].score, None);
+        assert_eq!(hits[0].load()?.frames.len(), 8_000);
+        assert!(search_files(&index, "drums kick", &filters, 40)?.is_empty());
+
+        std::fs::write(&snare, [0; 10])?;
+        assert!(hits[0].load().is_err());
+        assert!(search_files(&index, "snare", &filters, 40)?.is_empty());
+        Ok(())
     }
 
     #[test]

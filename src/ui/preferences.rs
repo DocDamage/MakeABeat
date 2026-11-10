@@ -3,6 +3,15 @@ use crate::app::{App, actions::Action};
 use eframe::egui::{self, Context, DragValue, ScrollArea};
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Copy)]
+pub(super) struct ControlColors {
+    pub edge: egui::Color32,
+    pub secondary_text: egui::Color32,
+    pub accent: egui::Color32,
+    pub focus: egui::Color32,
+    pub emphasis: f32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Preferences {
@@ -30,6 +39,26 @@ impl Default for Preferences {
 }
 
 impl Preferences {
+    pub(super) fn control_colors(self) -> ControlColors {
+        if self.high_contrast {
+            ControlColors {
+                edge: egui::Color32::from_gray(133),
+                secondary_text: egui::Color32::from_gray(221),
+                accent: super::MINT,
+                focus: egui::Color32::WHITE,
+                emphasis: 2.0,
+            }
+        } else {
+            ControlColors {
+                edge: super::EDGE,
+                secondary_text: super::DIM,
+                accent: super::GREEN,
+                focus: super::TEXT,
+                emphasis: 1.0,
+            }
+        }
+    }
+
     pub fn apply(self, ctx: &Context) {
         ctx.set_zoom_factor(if self.zoom.is_finite() {
             self.zoom.clamp(0.8, 1.45)
@@ -39,9 +68,10 @@ impl Preferences {
         super::style(ctx);
         ctx.style_mut(|style| {
             if self.high_contrast {
-                style.visuals.widgets.inactive.bg_stroke.color = egui::Color32::from_gray(133);
-                style.visuals.widgets.hovered.bg_stroke.color = egui::Color32::WHITE;
-                style.visuals.selection.stroke = egui::Stroke::new(2.0_f32, super::MINT);
+                let colors = self.control_colors();
+                style.visuals.widgets.inactive.bg_stroke.color = colors.edge;
+                style.visuals.widgets.hovered.bg_stroke.color = colors.focus;
+                style.visuals.selection.stroke = egui::Stroke::new(colors.emphasis, colors.accent);
             }
             if self.reduce_motion {
                 style.animation_time = 0.0;

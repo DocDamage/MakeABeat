@@ -54,18 +54,7 @@ pub fn decode_path(path: &Path) -> Result<Clip> {
 
 fn decode(source: Box<dyn MediaSource>, extension: Option<&str>) -> Result<Clip> {
     crate::background::stage("Decoding audio")?;
-    let mut hint = Hint::new();
-    if let Some(extension) = extension {
-        hint.with_extension(extension);
-    }
-    let mut format = symphonia::default::get_probe()
-        .format(
-            &hint,
-            MediaSourceStream::new(source, Default::default()),
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
-        )?
-        .format;
+    let mut format = probe_audio(source, extension)?;
     let track = format.default_track().ok_or("No audio track found")?;
     let track_id = track.id;
     let mut decoder =
@@ -116,6 +105,39 @@ fn decode(source: Box<dyn MediaSource>, extension: Option<&str>) -> Result<Clip>
         return Err("The file contained no decodable audio".into());
     }
     Ok(Clip::new(rate, samples))
+}
+
+fn probe_audio(
+    source: Box<dyn MediaSource>,
+    extension: Option<&str>,
+) -> Result<Box<dyn symphonia::core::formats::FormatReader>> {
+    let mut hint = Hint::new();
+    if let Some(extension) = extension {
+        hint.with_extension(extension);
+    }
+    Ok(symphonia::default::get_probe()
+        .format(
+            &hint,
+            MediaSourceStream::new(source, Default::default()),
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )?
+        .format)
+}
+
+pub fn audio_duration(path: &Path) -> Result<f64> {
+    let format = probe_audio(
+        Box::new(File::open(path)?),
+        path.extension().and_then(|ext| ext.to_str()),
+    )?;
+    let codec = &format.default_track().ok_or("No audio track found")?.codec_params;
+    if let (Some(frames), Some(rate)) = (codec.n_frames, codec.sample_rate)
+        && frames > 0 && rate > 0
+    {
+        return Ok(frames as f64 / f64::from(rate));
+    }
+    drop(format);
+    Ok(decode_path(path)?.duration())
 }
 
 fn clean(value: f32) -> f32 {

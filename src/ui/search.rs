@@ -8,19 +8,41 @@ use eframe::egui::{self, ComboBox, DragValue, Ui};
 
 pub fn show(app: &mut App, ui: &mut Ui) {
     ui.label(label("Search local samples", 26.0, TEXT).strong());
-    small(
-        ui,
-        "Describe the sound you want. Search uses audio already on this computer.",
-    );
+    let mut by_sound = app.search.by_sound;
+    ui.horizontal(|ui| {
+        ui.selectable_value(&mut by_sound, false, "Files & tags");
+        ui.selectable_value(&mut by_sound, true, "Sound · CLAP");
+    });
+    app.set_search_mode(by_sound);
+    small(ui, if by_sound {
+        "Describe the sound you want. CLAP searches indexed passages."
+    } else {
+        "Find audio by filename or tag. Leave the query blank to browse."
+    });
+    let empty = app.search.summary.roots.is_empty() && app.search.summary.passages == 0;
+    if empty {
+        small(ui, "Add a folder of samples to get started. Sound descriptions use the CLAP model.");
+        ui.horizontal_wrapped(|ui| {
+            if command_button(ui, app, Action::IndexFolder, "Add sample folder…").clicked() {
+                Action::IndexFolder.run(app);
+            }
+            if action(ui, "Download CLAP model", app.search_job().is_none())
+                .on_hover_text("Requires the pinned Python packages. Choose Python in Index and model setup.")
+                .clicked()
+            {
+                app.setup_sample_search();
+            }
+        });
+    }
     ui.horizontal_wrapped(|ui| {
         let field = ui.add(
             egui::TextEdit::singleline(&mut app.search.text)
-                .hint_text("Dusty drum break with a bright snare")
+                .hint_text(if by_sound { "Dusty drum break with a bright snare" } else { "Filename or tag" })
                 .desired_width(380.0)
                 .char_limit(256),
         );
         let enter = field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-        if primary(ui, "Search", !app.search.text.trim().is_empty()).clicked() || enter {
+        if primary(ui, "Search", !by_sound || !app.search.text.trim().is_empty()).clicked() || enter {
             app.search_sample_text();
         }
     });
@@ -32,8 +54,8 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                     ui.selectable_value(&mut filters.source, None, "Any source");
                     for kind in Kind::ALL { ui.selectable_value(&mut filters.source, Some(kind), kind.label()); }
                 });
-            ui.add(DragValue::new(&mut filters.min_seconds).range(0.0..=12.0).speed(0.1).prefix("Min ").suffix(" s"));
-            ui.add(DragValue::new(&mut filters.max_seconds).range(0.0..=12.0).speed(0.1).prefix("Max ").suffix(" s"));
+            ui.add(DragValue::new(&mut filters.min_seconds).range(0.0..=3600.0).speed(0.1).prefix("Min ").suffix(" s"));
+            ui.add(DragValue::new(&mut filters.max_seconds).range(0.0..=3600.0).speed(0.1).prefix("Max ").suffix(" s"));
             ui.add(DragValue::new(&mut filters.min_bpm).range(0..=300).prefix("Min BPM "));
             ui.add(DragValue::new(&mut filters.max_bpm).range(0..=300).prefix("Max BPM "));
             ui.add(egui::TextEdit::singleline(&mut filters.instrument).hint_text("Instrument tag")
@@ -81,11 +103,11 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         if app.search.results.is_empty() {
             small(
                 ui,
-                "No indexed passages matched. Check the filters and index status.",
+                "No results matched. Check the filters and index status.",
             );
         }
-    } else if app.search.summary.passages == 0 {
-        small(ui, "Open Index and model setup to add a source.");
+    } else if by_sound && !empty && app.search.summary.passages == 0 {
+        small(ui, "No indexed passages yet. Check progress and indexing issues in Index and model setup.");
     }
     let pad = Some(app.selected_pad)
         .filter(|&i| app.studio.pads[i].is_none())
@@ -117,8 +139,10 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                 if !hit.location.instrument.is_empty() {
                     small(ui, &hit.location.instrument);
                 }
-                ui.label(label(format!("Score {:.3}", hit.score), 12.0, DIM))
-                    .on_hover_text("A ranking score within this search");
+                if let Some(score) = hit.score {
+                    ui.label(label(format!("Score {score:.3}"), 12.0, DIM))
+                        .on_hover_text("A ranking score within this search");
+                }
             });
             ui.horizontal_wrapped(|ui| {
                 if action(ui, "Audition with beat", app.output.is_some()).clicked() {
@@ -190,10 +214,13 @@ fn index(app: &mut App, ui: &mut Ui) {
             ),
         );
         let has_roots = !summary.roots.is_empty();
-        if action(ui, "Rescan / resume", idle && has_roots).clicked() {
+        if action(ui, "Rescan files", idle && has_roots).clicked() {
+            app.rescan_search_files();
+        }
+        if action(ui, "Resume CLAP indexing", idle && has_roots).clicked() {
             app.resume_sample_index();
         }
-        if action(ui, "Rebuild index", idle && has_roots).clicked() {
+        if action(ui, "Rebuild CLAP index", idle && has_roots).clicked() {
             app.rebuild_sample_search();
         }
     });

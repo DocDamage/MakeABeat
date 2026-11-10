@@ -190,6 +190,8 @@ fn corner_controls(ui: &mut Ui, label: &str, cell: &mut Cell) -> bool {
 }
 
 pub(super) fn show(app: &mut App, ui: &mut Ui, state: &mut State) {
+    let high_contrast = app.library.interface.high_contrast;
+    let colors = app.library.interface.control_colors();
     let selection = &mut state.selection;
     let can_select = !app.recording && app.song_playing.is_none();
     let selecting = selection.enabled() && can_select;
@@ -259,7 +261,7 @@ pub(super) fn show(app: &mut App, ui: &mut Ui, state: &mut State) {
                     };
                     ui.add_sized(
                         [step_width, 14.0],
-                        Label::new(label(text, 10.0, FAINT).monospace()),
+                        Label::new(label(text, 10.0, if high_contrast { colors.secondary_text } else { FAINT }).monospace()),
                     );
                 }
             });
@@ -337,12 +339,16 @@ pub(super) fn show(app: &mut App, ui: &mut Ui, state: &mut State) {
                                 .is_some_and(|region| region.contains(cell));
                         let p = ui.painter_at(rect);
                         let color = fill.unwrap_or(if response.hovered() { EDGE } else { empty });
-                        let stroke = if marked {
+                        let stroke = if response.has_focus() && high_contrast {
+                            Stroke::new(colors.emphasis, colors.focus)
+                        } else if marked {
                             Stroke::new(2.0_f32, BLUE)
                         } else if response.has_focus() || active {
-                            Stroke::new(1.2_f32, MINT)
+                            Stroke::new(colors.emphasis.max(1.2), MINT)
                         } else if state.velocity_cell == Some(cell) {
-                            Stroke::new(1.2_f32, GOLD)
+                            Stroke::new(colors.emphasis.max(1.2), GOLD)
+                        } else if high_contrast {
+                            Stroke::new(1.0_f32, if fill.is_some() { MINT } else { colors.edge })
                         } else {
                             Stroke::NONE
                         };
